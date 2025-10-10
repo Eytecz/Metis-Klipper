@@ -54,7 +54,6 @@ class PurgeBelt:
         # Internal state
         self.sync_status = False
         self.purge_belt_stepper = None
-        self.ea_index = None
 
     def handle_ready(self):
         self.min_event_systime = self.reactor.monotonic()
@@ -184,7 +183,6 @@ class PurgeBelt:
             # Do the actual purging
             self.sync_purge_belt(layer_height, extrusion_width)
             self.gcode_move.last_position[3] += purge_length
-            self.gcode_move.last_position[self.ea_index] += purge_length
             self.toolhead.move(self.gcode_move.last_position, extrusion_speed)
             self.toolhead.wait_moves()
             self.unsync_purge_belt()
@@ -211,7 +209,6 @@ class PurgeBelt:
                 # Do the actual purging
                 self.sync_purge_belt(layer_height, extrusion_width)
                 self.gcode_move.last_position[3] += purge_length
-                self.gcode_move.last_position[self.ea_index] += purge_length
                 self.toolhead.move(self.gcode_move.last_position, extrusion_speed)
                 self.toolhead.wait_moves()
                 self.unsync_purge_belt()
