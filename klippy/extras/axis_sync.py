@@ -37,6 +37,13 @@ class AxisSync:
             stepper.rail.set_trapq(orig_trapq)
             if hasattr(stepper, '_sync_orig_trapq'):
                 delattr(stepper, '_sync_orig_trapq')
+            
+            # Restore original position
+            if hasattr(stepper, '_sync_orig_position'):
+                orig_pos = stepper._sync_orig_position
+                stepper.do_set_position(orig_pos)
+                delattr(stepper, '_sync_orig_position')
+            
             motion_queuing.check_step_generation_scan_windows()
             return
         
@@ -45,9 +52,12 @@ class AxisSync:
         if extruder is None or not hasattr(extruder, 'get_trapq'):
             raise self.printer.command_error("'%s' is not a valid extruder" % extruder_name)
         
-        # Store original trapq and sync
+        # Store original trapq and position
         if not hasattr(stepper, '_sync_orig_trapq'):
             stepper._sync_orig_trapq = stepper.get_trapq()
+        if not hasattr(stepper, '_sync_orig_position'):
+            stepper._sync_orig_position = stepper.get_position()[0]
+        
         stepper.do_set_position(extruder.last_position)
         stepper.rail.set_trapq(extruder.get_trapq())
         motion_queuing.check_step_generation_scan_windows()
