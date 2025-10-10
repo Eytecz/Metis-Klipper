@@ -93,7 +93,6 @@ class Liftbar:
         # Intercept z-axis motions on the toolhead and replace with custom one
         self.toolhead = self.printer.lookup_object('toolhead')
         self.gcode_move = self.printer.lookup_object('gcode_move')
-        self.gcode_axis_sync = self.printer.lookup_object('gcode_axis_sync')
         
     def cmd_LIFTBAR(self, gcmd):
         enable = gcmd.get_int('ENABLE', None)
@@ -219,15 +218,15 @@ class Liftbar:
             self.synced = not self.synced
         else:
             self.synced = sync
-        if self.synced == True:
-            self.gcode_axis_sync.sync_manual_stepper(self.rail_name_stepper_a.split()[1], master_axis_id="Z", absolute=True,
-                                        limited=True, invert=False, offset=self.safe_tracking_distance)
-            self.gcode_axis_sync.sync_manual_stepper(self.rail_name_stepper_b.split()[1], master_axis_id="Z", absolute=True,
-                                        limited=True, invert=False, offset=self.safe_tracking_distance)
-            self.gcode_axis_sync.run_presync_queue()
-        else:
-            self.gcode_axis_sync.unsync_manual_stepper(self.rail_name_stepper_a.split()[1])
-            self.gcode_axis_sync.unsync_manual_stepper(self.rail_name_stepper_b.split()[1])
+        # if self.synced == True:
+        #     self.gcode_axis_sync.sync_manual_stepper(self.rail_name_stepper_a.split()[1], master_axis_id="Z", absolute=True,
+        #                                 limited=True, invert=False, offset=self.safe_tracking_distance)
+        #     self.gcode_axis_sync.sync_manual_stepper(self.rail_name_stepper_b.split()[1], master_axis_id="Z", absolute=True,
+        #                                 limited=True, invert=False, offset=self.safe_tracking_distance)
+        #     self.gcode_axis_sync.run_presync_queue()
+        # else:
+        #     self.gcode_axis_sync.unsync_manual_stepper(self.rail_name_stepper_a.split()[1])
+        #     self.gcode_axis_sync.unsync_manual_stepper(self.rail_name_stepper_b.split()[1])
 
     def do_tool_dropoff(self, dock):
         # Unsync liftbar to allow independent motion
