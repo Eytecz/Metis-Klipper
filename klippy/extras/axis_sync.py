@@ -24,7 +24,6 @@ class AxisSync:
         self.toolhead = self.printer.lookup_object('toolhead')
 
     def sync_stepper_to_extruder(self, stepper_name, extruder_name):
-        """Sync manual stepper to extruder (similar to extruder.py approach)"""
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         motion_queuing = self.printer.lookup_object('motion_queuing')
