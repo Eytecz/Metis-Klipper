@@ -36,6 +36,8 @@ class PurgeBelt:
         self.return_to_start_pos = config.getboolean('return_to_start_pos', True)
         self.max_flow_rate = config.getfloat('max_flow_rate', 40., above=0)
         self.flow_rate = config.getfloat('flow_rate', 30., above=0)
+        self.stepper_name = config.get('stepper_name', 'purge_belt_stepper')
+        
 
         # Register handlers
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -63,10 +65,10 @@ class PurgeBelt:
 
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
             rail_name = manual_stepper[1].get_steppers()[0].get_name()
-            if rail_name == 'manual_stepper purge_belt_stepper':
+            if rail_name == f'manual_stepper {self.stepper_name}':
                 self.purge_belt_stepper = manual_stepper[1]
         if self.purge_belt_stepper is None:
-            raise self.printer.config_error("manual_stepper purge_belt_stepper must be specified")
+            raise self.printer.config_error(f"manual_stepper {self.stepper_name} must be specified")
     
     # Calculate new purge belt rotation distance when synchronized to the extruder
     def calc_purge_belt_rotation_distance_synced(self, layer_height, extrusion_width):
@@ -95,37 +97,21 @@ class PurgeBelt:
             self.last_purge_belt_rotation_distance = self.purge_belt_stepper.get_steppers()[0].get_rotation_distance()[0]
             rotation_dist = self.calc_purge_belt_rotation_distance_synced(layer_height, extrusion_width)
             self.purge_belt_stepper.get_steppers()[0].set_rotation_distance(rotation_dist)
-            ea = self.get_available_ea_label()
-            self.gcode.run_script_from_command(
-                f'MANUAL_STEPPER STEPPER=purge_belt_stepper GCODE_AXIS={ea}')
-            self.ea_index = self.get_ea_index(ea)
-            logging.info(f'Synchronized purge belt with extruder on axis {ea} with index {self.ea_index}')
+            axis_sync = self.printer.lookup_object('axis_sync')
+            extruder_name = self.toolhead.get_extruder().get_name()
+            stepper_name = f'manual_stepper {self.stepper_name}'
+            axis_sync.sync_stepper_to_extruder(stepper_name, extruder_name)
             self.sync_status = True
 
     def unsync_purge_belt(self):
         if not self.sync_status:
             pass
         else:
-            self.gcode.run_script_from_command(
-                f'MANUAL_STEPPER STEPPER=purge_belt_stepper GCODE_AXIS=')
+            axis_sync = self.printer.lookup_object('axis_sync')
+            stepper_name = f'manual_stepper {self.stepper_name}'
+            axis_sync.sync_stepper_to_extruder(stepper_name, extruder_name=None)
             self.purge_belt_stepper.get_steppers()[0].set_rotation_distance(self.last_purge_belt_rotation_distance)
             self.sync_status = False
-
-    def get_available_ea_label(self):
-        axis_map = self.gcode_move.axis_map
-        used_axes = set(axis_map.keys())
-        for letter in string.ascii_uppercase:
-            if letter in ("X", "Y", "Z", "E", "F", "N"):
-                continue
-            if letter not in used_axes:
-                return letter
-        raise ValueError("No free axis label found")
-    
-    def get_ea_index(self, ea):
-        ea_index = self.gcode_move.axis_map[f"{ea}"]
-        if ea_index is None:
-            raise ValueError(f"Axis label {ea} is not available")
-        return ea_index
 
     def get_init_toolhead_pos(self):
         init_toolhead_pos = self.toolhead.get_position()
