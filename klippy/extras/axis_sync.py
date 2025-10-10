@@ -12,19 +12,16 @@ class AxisSync:
         self.gcode = self.printer.lookup_object('gcode')
         
         # Register event handlers
-        self.printer.register_event_handler("klippy:connect", 
-                                           self._handle_connect)
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
         
         # Register commands
-        self.gcode.register_command('SYNC_STEPPER_EXTRUDER', 
-                                  self.cmd_SYNC_STEPPER_EXTRUDER,
-                                  desc=self.cmd_SYNC_STEPPER_EXTRUDER_help)
+        self.gcode.register_command('SYNC_EXTRUDER_STEPPER', self.cmd_SYNC_EXTRUDER_STEPPER,
+                                  desc=self.cmd_SYNC_EXTRUDER_STEPPER_help)
 
-    def _handle_connect(self):
+    def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
 
-    def sync_stepper_to_extruder(self, stepper_name, extruder_name):
-        """Sync manual stepper to extruder (similar to extruder.py approach)"""
+    def sync_stepper_to_extruder(self, stepper_name, extruder_name=None):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
         motion_queuing = self.printer.lookup_object('motion_queuing')
@@ -38,7 +35,6 @@ class AxisSync:
         if not extruder_name:
             orig_trapq = getattr(stepper, '_sync_orig_trapq', None)
             stepper.rail.set_trapq(orig_trapq)
-            stepper.motion_queue = None
             if hasattr(stepper, '_sync_orig_trapq'):
                 delattr(stepper, '_sync_orig_trapq')
             motion_queuing.check_step_generation_scan_windows()
@@ -54,13 +50,12 @@ class AxisSync:
             stepper._sync_orig_trapq = stepper.get_trapq()
         stepper.do_set_position(extruder.last_position)
         stepper.rail.set_trapq(extruder.get_trapq())
-        stepper.motion_queue = extruder_name
         motion_queuing.check_step_generation_scan_windows()
 
-    cmd_SYNC_STEPPER_EXTRUDER_help = "Sync manual stepper with extruder motion queue"
-    def cmd_SYNC_STEPPER_EXTRUDER(self, gcmd):
+    cmd_SYNC_EXTRUDER_STEPPER_help = "Sync manual stepper with extruder motion queue"
+    def cmd_SYNC_EXTRUDER_STEPPER(self, gcmd):
         stepper = gcmd.get('STEPPER')
-        extruder = gcmd.get('EXTRUDER', '')
+        extruder = gcmd.get('EXTRUDER', None)
         
         try:
             self.sync_stepper_to_extruder(stepper, extruder)
@@ -69,7 +64,7 @@ class AxisSync:
             else:
                 gcmd.respond_info("Stepper '%s' unsynced" % stepper)
         except Exception as e:
-            raise self.gcode.error("SYNC_STEPPER_EXTRUDER error: %s" % str(e))
+            raise self.gcode.error("SYNC_EXTRUDER_STEPPER error: %s" % str(e))
 
 def load_config(config):
     return AxisSync(config)
