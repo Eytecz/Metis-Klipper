@@ -37,7 +37,6 @@ class PurgeBelt:
         self.max_flow_rate = config.getfloat('max_flow_rate', 40., above=0)
         self.flow_rate = config.getfloat('flow_rate', 30., above=0)
         self.stepper_name = config.get('stepper_name', 'purge_belt_stepper')
-        
 
         # Register handlers
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -60,7 +59,6 @@ class PurgeBelt:
 
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
-        self.gcode_move = self.printer.lookup_object('gcode_move')
 
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
             rail_name = manual_stepper[1].get_steppers()[0].get_name()
@@ -114,8 +112,7 @@ class PurgeBelt:
 
     def get_init_toolhead_pos(self):
         init_toolhead_pos = self.toolhead.get_position()
-        self.gcode_move.last_position = init_toolhead_pos
-        return init_toolhead_pos
+        return list(init_toolhead_pos)
 
     def cmd_PURGE_WITH_BELT(self, gcmd):
         layer_height = gcmd.get_float('LAYER_HEIGHT', self.purge_layer_height)
@@ -153,17 +150,27 @@ class PurgeBelt:
         # Get initial position to return to
         self.init_pos = self.get_init_toolhead_pos()
 
-        # Travel to park location
-        self.gcode_move.last_position = [self.park_pos_x, self.park_pos_y, self.park_pos_z, self.init_pos[3]]
-        self.toolhead.move(self.gcode_move.last_position, self.travel_speed)
+        # Travel to park location - create new position array
+        new_pos = list(self.init_pos)
+        new_pos[0] = self.park_pos_x
+        new_pos[1] = self.park_pos_y
+        new_pos[2] = self.park_pos_z
+        # Keep current extruder position
+        self.toolhead.move(new_pos, self.travel_speed)
         self.toolhead.wait_moves()
     
     def restore_pos(self):
+        # Ensure all moves are done before restoring position
+        self.toolhead.wait_moves()
+        self.toolhead.set_position(self.toolhead.get_position())
+
         # Return to initial position
         if self.return_to_start_pos:
-            self.init_pos[3] = self.gcode_move.last_position[3]
-            self.gcode.last_position = self.init_pos
-            self.toolhead.move(self.gcode_move.last_position, self.travel_speed)
+            # Restore XYZ but keep current extruder position
+            current_pos = self.toolhead.get_position()
+            restore_pos = list(self.init_pos)
+            restore_pos[3] = current_pos[3]  # Keep current E position
+            self.toolhead.move(restore_pos, self.travel_speed)
             self.toolhead.wait_moves()
     
     def purge_cycle(self, purge_length, layer_height, extrusion_width, extrusion_speed, pause_qty, pause_time):
@@ -176,53 +183,69 @@ class PurgeBelt:
         # Purge with or without pauses
         if pause_qty == 0:
             # Travel to purge height above belt depending on layer height
-            self.gcode_move.last_position[2] = purge_height
-            self.toolhead.move(self.gcode_move.last_position, self.approach_speed) 
+            current_pos = self.toolhead.get_position()
+            purge_pos = list(current_pos)
+            purge_pos[2] = purge_height
+            self.toolhead.move(purge_pos, self.approach_speed) 
             self.toolhead.wait_moves()      
 
             # Do the actual purging
             self.sync_purge_belt(layer_height, extrusion_width)
-            self.gcode_move.last_position[3] += purge_length
-            self.toolhead.move(self.gcode_move.last_position, extrusion_speed)
+            current_pos = self.toolhead.get_position()
+            extrude_pos = list(current_pos)
+            extrude_pos[3] += purge_length
+            self.toolhead.move(extrude_pos, extrusion_speed)
             self.toolhead.wait_moves()
             self.unsync_purge_belt()
 
             # Retract filament and keep belt running for an additional distance
-            self.gcode_move.last_position[3]-= self.retract_dist
+            current_pos = self.toolhead.get_position()
+            retract_pos = list(current_pos)
+            retract_pos[3] -= self.retract_dist
             movepos = self.purge_belt_stepper.get_position()[0] + self.purge_belt_retract_travel_dist
             self.purge_belt_stepper.do_move(movepos, self.purge_belt_stepper.velocity, self.purge_belt_stepper.accel, sync=True)
-            self.toolhead.move(self.gcode_move.last_position, self.retract_speed)
+            self.toolhead.move(retract_pos, self.retract_speed)
             self.toolhead.wait_moves()
             
             # Return to parking position
-            self.gcode_move.last_position[2] = self.park_pos_z
-            self.toolhead.move(self.gcode_move.last_position, self.travel_speed)
+            current_pos = self.toolhead.get_position()
+            park_pos = list(current_pos)
+            park_pos[2] = self.park_pos_z
+            self.toolhead.move(park_pos, self.travel_speed)
             self.toolhead.wait_moves()
         else:
-            purge_length = purge_length / (pause_qty + 1)
+            purge_length_per_section = purge_length / (pause_qty + 1)
             for i in range(pause_qty + 1):
-                # Travel to purge height above belt depending on layer  height
-                self.gcode_move.last_position[2] = purge_height
-                self.toolhead.move(self.gcode_move.last_position, self.approach_speed) 
+                # Travel to purge height above belt depending on layer height
+                current_pos = self.toolhead.get_position()
+                purge_pos = list(current_pos)
+                purge_pos[2] = purge_height
+                self.toolhead.move(purge_pos, self.approach_speed) 
                 self.toolhead.wait_moves()
 
                 # Do the actual purging
                 self.sync_purge_belt(layer_height, extrusion_width)
-                self.gcode_move.last_position[3] += purge_length
-                self.toolhead.move(self.gcode_move.last_position, extrusion_speed)
+                current_pos = self.toolhead.get_position()
+                extrude_pos = list(current_pos)
+                extrude_pos[3] += purge_length_per_section
+                self.toolhead.move(extrude_pos, extrusion_speed)
                 self.toolhead.wait_moves()
                 self.unsync_purge_belt()
 
                 # Retract filament and keep belt running for an additional distance
-                self.gcode_move.last_position[3]-= self.retract_dist
+                current_pos = self.toolhead.get_position()
+                retract_pos = list(current_pos)
+                retract_pos[3] -= self.retract_dist
                 movepos = self.purge_belt_stepper.get_position()[0] + self.purge_belt_retract_travel_dist
                 self.purge_belt_stepper.do_move(movepos, self.purge_belt_stepper.velocity, self.purge_belt_stepper.accel, sync=True)
-                self.toolhead.move(self.gcode_move.last_position, self.retract_speed)
+                self.toolhead.move(retract_pos, self.retract_speed)
                 self.toolhead.wait_moves()
 
                 # Return to parking position
-                self.gcode_move.last_position[2] = self.park_pos_z
-                self.toolhead.move(self.gcode_move.last_position, self.travel_speed)
+                current_pos = self.toolhead.get_position()
+                park_pos = list(current_pos)
+                park_pos[2] = self.park_pos_z
+                self.toolhead.move(park_pos, self.travel_speed)
                 self.toolhead.wait_moves()
 
                 # Dwell for the defined pause time if not last iteration
@@ -238,9 +261,6 @@ class PurgeBelt:
 
         # Return to start position
         self.restore_pos()
-
-
-
-
+        
 def load_config(config):
   return PurgeBelt(config)

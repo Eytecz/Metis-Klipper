@@ -40,11 +40,17 @@ class SpoolMotionControl:
         self.hbridge_motor_name = config.get('hbridge_motor', None)
         self.stepper_name = config.get('stepper', None)
         self.vl6180_name = config.get('vl6180_sensor', None)
+        if self.vl6180_name:
+            self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
+
 
         # Register g-code commands
         self.gcode.register_mux_command('SPOOL_MOTION_CONTROL', 'SPOOL', self.name,
                                         self.cmd_SPOOL_MOTION_CONTROL,
                                         desc="Control spool motion functionality.")
+        self.gcode.register_mux_command('MEASURE_SPOOL_DIAMETER', 'SPOOL', self.name,
+                                        self.cmd_MEASURE_SPOOL_DIAMETER,
+                                        desc="Measure and report the current spool diameter.")
 
     def handle_ready(self):
         pass
@@ -76,7 +82,7 @@ class SpoolMotionControl:
             for vl6180 in self.printer.lookup_objects('vl6180'):
                 name = vl6180[1].get_name()
                 if name == self.vl6180_name:
-                    self.vl6180 = vl6180
+                    self.vl6180 = vl6180[1]
             if self.vl6180 is None:
                 raise self.config.error("Could not find vl6180 '%s'" % self.vl6180_name)
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
@@ -91,6 +97,13 @@ class SpoolMotionControl:
     def cmd_SPOOL_MOTION_CONTROL(self, gcmd):
         self.enable_tracking = not self.enable_tracking
         logging.info(f'self.enable_tracking set to {self.enable_tracking}')
+    
+    def cmd_MEASURE_SPOOL_DIAMETER(self, gcmd):
+        if not self.spool_measurement or not hasattr(self, 'vl6180'):
+            gcmd.respond_info("Spool measurement or VL6180 sensor not enabled.")
+            return
+        diameter = self.estimate_spool_diameter()
+        gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f} mm")
     
     def _trapq_append_intercept(self, *args):
         logging.info(f'_trapq_append_intercept with args: {args}')
@@ -152,12 +165,18 @@ class SpoolMotionControl:
         pwm_value = 1.0 * move_dir
         self.hbridge_motor.scheduled_async_motion(pwm_value, print_time, runtime)
 
+    def estimate_spool_diameter(self):
+        if self.spool_measurement and self.vl6180:
+            measurement = self.vl6180.vl6180_single_range_measurement()
+            if measurement < 255.0:
+                value = (self.vl6180_center_distance - measurement) * 2
+                value = max(self.spool_diameter[0], min(value, self.spool_diameter[1]))
+                logging.info(f'Estimated spool diameter: {value} mm based on measurement: {measurement} mm')
+                return value
+            else:
+                logging.warning('VL6180 sensor did not return a valid measurement')
+                return None
+
+
 def load_config_prefix(config):
     return SpoolMotionControl(config)
-
-
-        
-
-    
-        
-
