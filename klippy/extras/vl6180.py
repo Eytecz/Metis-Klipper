@@ -321,9 +321,9 @@ class vl6180:
         self.gcode.respond_info(f'Single shot measurement: {range_value} mm')
 
   def cmd_DIAG_VL_SENSOR(self, gcmd):
-    # Get all register constants from the class
+    # Get only register constants (those with double underscore in the name)
     registers = {name: value for name, value in vars(self.__class__).items() 
-                if isinstance(value, int) and not name.startswith('_')}
+                if isinstance(value, int) and '__' in name}
     
     # Sort by register address for logical output order
     sorted_registers = sorted(registers.items(), key=lambda x: x[1])
