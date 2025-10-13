@@ -331,7 +331,7 @@ class vl6180:
     for reg_name, reg_addr in sorted_registers:
       try:
         reg_value = self.get_register(reg_addr)
-        self.gcode.respond_info('%s: %s' % (reg_name, hex(reg_value)))
+        self.gcode.respond_info('%s: %s (%d)' % (reg_name, hex(reg_value), reg_value))
       except Exception as e:
         self.gcode.respond_info('%s: Error reading register - %s' % (reg_name, str(e)))
 
