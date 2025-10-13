@@ -167,7 +167,10 @@ class SpoolMotionControl:
 
     def estimate_spool_diameter(self):
         if self.spool_measurement and self.vl6180:
-            measurement = self.vl6180.vl6180_single_range_measurement()
+            measurement = self.vl6180.single_range_measurement()
+            if measurement == 255.0:
+                logging.info(f'No spool detected')
+                return 
             if measurement < 255.0:
                 value = (self.vl6180_center_distance - measurement) * 2
                 value = max(self.spool_diameter[0], min(value, self.spool_diameter[1]))
@@ -175,7 +178,7 @@ class SpoolMotionControl:
                 return value
             else:
                 logging.warning('VL6180 sensor did not return a valid measurement')
-                return None
+                return self.spool_diameter[1]
 
 
 def load_config_prefix(config):

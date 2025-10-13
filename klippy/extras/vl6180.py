@@ -11,25 +11,25 @@ import logging
 
 class EnableHelper:
   def __init__(self, mcu, pin_desc, cmd_queue=None, value=0):
-    self.enable_pin = bus.MCU_bus_digital_out(mcu, pin_desc, cmd_queue, value)
+      self.enable_pin = bus.MCU_bus_digital_out(mcu, pin_desc, cmd_queue, value)
 
   def init(self):
-    mcu = self.enable_pin.get_mcu()
-    reactor = mcu.get_printer().get_reactor()
-    curtime = reactor.monotonic()
-    print_time = mcu.estimated_print_time(curtime)
+      mcu = self.enable_pin.get_mcu()
+      reactor = mcu.get_printer().get_reactor()
+      curtime = reactor.monotonic()
+      print_time = mcu.estimated_print_time(curtime)
 
-    # Ensure chip is powered off
-    minclock = mcu.print_time_to_clock(print_time + mcu.min_schedule_time())
-    self.enable_pin.update_digital_out(value=0, minclock=minclock)
+      # Ensure chip is powered off
+      minclock = mcu.print_time_to_clock(print_time + mcu.min_schedule_time())
+      self.enable_pin.update_digital_out(value=0, minclock=minclock)
 
-    # Enable chip
-    minclock = mcu.print_time_to_clock(print_time + 2 * mcu.min_schedule_time())
-    self.enable_pin.update_digital_out(value=1, minclock=minclock)
+      # Enable chip
+      minclock = mcu.print_time_to_clock(print_time + 2 * mcu.min_schedule_time())
+      self.enable_pin.update_digital_out(value=1, minclock=minclock)
 
-    # Force a delay for any subsequent commands on the command queue
-    waketime = curtime + 5 * mcu.min_schedule_time()
-    reactor.pause(waketime)
+      # Force a delay for any subsequent commands on the command queue
+      waketime = curtime + 5 * mcu.min_schedule_time()
+      reactor.pause(waketime)
  
 class vl6180:
   IDENTIFICATION__MODEL_ID              = 0x0000
@@ -83,6 +83,9 @@ class vl6180:
   FIRMWARE__BOOTUP                      = 0x0119
   I2C_SLAVE__DEVICE_ADDRESS             = 0x0212
 
+  # Add timeout constant
+  MEASUREMENT_TIMEOUT_MS = 1000
+  POLLING_DELAY_US = 1000
 
   def __init__(self, config):
     self.config = config
@@ -98,18 +101,22 @@ class vl6180:
       self.i2c = bus.MCU_I2C_from_config(self.config, self.i2c_slave_address, default_speed=100000)
 
     self.gcode = self.printer.lookup_object('gcode')
-    self.gcode.register_mux_command('MEASURE_DISTANCE', 'SENSOR', self.name,
-                                    self.cmd_MEASURE_DISTANCE,
-                                    desc = "Returns the measured value on vl6180 sensor")
+    self.gcode.register_mux_command('SINGLE_SHOT_MEASUREMENT', 'SENSOR', self.name,
+                                    self.cmd_SINGLE_SHOT_MEASUREMENT,
+                                    desc = "Performs a single shot measurement with proper error handling")
     self.gcode.register_mux_command('DIAG_VL_SENSOR', 'SENSOR', self.name,
                                     self.cmd_DIAG_VL_SENSOR,
                                     desc = "Returns sensor diagnostics")
-    self.gcode.register_mux_command('SET_VL_INIT_REG', 'SENSOR', self.name,
-                                    self.cmd_SET_VL_INIT_REG,
-                                    desc = "Sets the initial registers as recommended")
-    self.gcode.register_mux_command('CONTINUOUS_RANGE_MEASUREMENT', 'SENSOR', self.name,
-                                    self.cmd_CONTINUOUS_RANGE_MEASUREMENT,
-                                    desc = "Starts a continuous range measurement and returns the values for an n amount of samples")
+    self.gcode.register_mux_command('GET_VL_OFFSET', 'SENSOR', self.name,
+                                    self.cmd_GET_VL_OFFSET,
+                                    desc = "Read current VL sensor offset calibration value")
+    self.gcode.register_mux_command('SET_VL_OFFSET', 'SENSOR', self.name,
+                                    self.cmd_SET_VL_OFFSET,
+                                    desc = "Set VL sensor offset calibration value")
+    self.gcode.register_mux_command('CALIBRATE_VL_OFFSET', 'SENSOR', self.name,
+                                   self.cmd_CALIBRATE_VL_OFFSET,
+                                   desc = "Perform automated offset calibration at specified distance")
+    
     self.printer.register_event_handler('klippy:connect', self.handle_connect)
   
   def handle_connect(self):
@@ -126,9 +133,6 @@ class vl6180:
     self.set_init_reg()
     self.set_register(0x0016, 0x00)     # Change fresh out of set satus to 0
     logging.info(f'successfully connected VL6180 {self.name} on address {self.i2c.get_i2c_address()}')
-
-  def cmd_SET_VL_INIT_REG(self, gcmd):
-    self.set_init_reg()
 
   def set_init_reg(self):
     # Recommended settings required to be loaded onto the VL6180 during the initialisation of the device
@@ -199,38 +203,64 @@ class vl6180:
     while (timeit.default_timer() - start_time) * 1e6 < us:
       pass
 
-  def vl6180_start_range(self):
+  def single_shot_measurement(self):
+    # Step 1: Check device is ready to start a range measurement (Optional)
+    range_status = self.get_register(self.RESULT__RANGE_STATUS)
+    if not (range_status & 0x01):
+        logging.info('Device not ready for range measurement')
+        return None, "Device not ready"
+    
+    # Step 2: Start a range measurement
     self.set_register(self.SYSRANGE__START, 0x01)
+    
+    # Step 3: Wait for range measurement to complete
+    timeout_counter = 0
+    max_timeout = self.MEASUREMENT_TIMEOUT_MS  # Use class constant
+    
+    while True:
+        interrupt_status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
+        
+        # Check for errors first
+        error_value = (interrupt_status >> 6) & 0b11
+        if error_value != 0:
+            error_description, _ = self.interrupt_status_lookup(interrupt_status)
+            logging.info(f'Error during measurement: {error_description}')
+            self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+            return None, error_description
+        
+        # Check for threshold events
+        range_event = interrupt_status & 0b111
+        if range_event == 4:  # New Sample Ready threshold event
+            break
+        
+        # Add timeout protection
+        timeout_counter += 1
+        if timeout_counter > max_timeout:
+            logging.info('Measurement timeout')
+            self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+            return None, "Measurement timeout"
+        
+        self.delay(self.POLLING_DELAY_US)  # Use class constant
+    
+    # Step 4: Reading range result
+    range_value = self.get_register(self.RESULT__RANGE_VAL)
 
-  def vl6180_poll_range(self):
-    status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
-    range_status = status & 0x07
-    while range_status != 0x04:
-      status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
-      range_status = status & 0x07
-      self.delay(1000)
+    # Step 5: Check result range status for any warnings or errors
+    error_description = None
+    range_status = self.get_register(self.RESULT__RANGE_STATUS)
+    if (range_status >> 4) & 0x0F != 0:
+        error_description = self.result_range_status_lookup(range_status)
+        logging.info(f'Warning in range status: {error_description}')
 
-  def vl6180_read_range(self):
-    range = self.get_register(self.RESULT__RANGE_VAL)
-    return range
-  
-  def vl6180_clear_interrupts(self):
+    # Step 6: Clear the Interrupt status
     self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
-
-  def vl6180_single_range_measurement(self):
-    self.vl6180_start_range()
-    self.vl6180_poll_range()
-    value = self.vl6180_read_range()
-    self.vl6180_clear_interrupts()
-    return value
+    
+    return range_value, error_description
 
   def interrupt_status_lookup(self, status):
-    self.gcode.respond_info('Status: %s' % status)
-    # Get error values
     error_value = (status >> 6) & 0b11
     range_value = status & 0b111
 
-    # Define dictionaries for error and range descriptions
     interrupt_error_descriptions = {
       0: "No error reported",
       1: "Laser Safety Error",
@@ -244,105 +274,167 @@ class vl6180:
       4: "New Sample Ready threshold event"
     }
 
-    # Read out dictionary with error and range values
     error_description = interrupt_error_descriptions.get(error_value, "Unknown error")
     range_description = interrupt_range_descriptions.get(range_value, "Unknown range event")
 
     return error_description, range_description
   
+  def result_range_status_lookup(self, status):
+    error_code = (status >> 4) & 0x0F
+    error_descriptions = {
+      0x0: "No error",                           # 0000
+      0x1: "VCSEL Continuity Test",              # 0001
+      0x2: "VCSEL Watchdog Test",                # 0010
+      0x3: "VCSEL Watchdog",                     # 0011
+      0x4: "PLL1 Lock",                          # 0100
+      0x5: "PLL2 Lock",                          # 0101
+      0x6: "Early Convergence Estimate",         # 0110
+      0x7: "Max Convergence",                    # 0111
+      0x8: "No Target Ignore",                   # 1000
+      0x9: "Not used",                           # 1001
+      0xA: "Not used",                           # 1010
+      0xB: "Max Signal To Noise Ratio",          # 1011
+      0xC: "Raw Ranging Algo Underflow",         # 1100
+      0xD: "Raw Ranging Algo Overflow",          # 1101
+      0xE: "Ranging Algo Underflow",             # 1110
+      0xF: "Ranging Algo Overflow"               # 1111
+    }
+    return error_descriptions.get(error_code, "Unknown error code")
+
+  def get_offset_calibration_data(self):
+        return self.get_register(self.SYSRANGE__PART_TO_PART_RANGE_OFFSET)
+    
+  def set_offset_calibration(self, offset_value):
+        self.set_register(self.SYSRANGE__PART_TO_PART_RANGE_OFFSET, offset_value & 0xFF)
+
   def get_name(self):
         return self.name
-
-  def cmd_MEASURE_DISTANCE(self, gcmd):
-    self.gcode.respond_info('Measured distance: %i' % self.vl6180_single_range_measurement())
   
-  def cmd_CONTINUOUS_RANGE_MEASUREMENT(self, gcmd):
-    samples = gcmd.get_int('SAMPLES', 10)
-    self.set_register(self.SYSRANGE__START, 0x03)   # Start Ranging Mode Continuous
-    self.delay(5e5)
-    for _ in range(samples):
-      if self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO) == 0x04:
-        value = self.get_register(self.RESULT__RANGE_VAL)
-        self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
-        self.gcode.respond_info('RESULT__RANGE_VAL: %i mm' % value)
-        self.delay(1e6)
-      else:
-        interrupt_status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
-        interrupt_status_descriptions = self.interrupt_status_lookup(interrupt_status)
-        error_description = interrupt_status_descriptions[0][0]
-        range_description = interrupt_status_descriptions[0][1]
-        self.gcode.respond_info('Error status: %s' % error_description)
-        self.gcode.respond_info('Range status: %s' % range_description)
-        return
-    self.set_register(self.SYSRANGE__START, 0x01)   # Stop ranging
+  def cmd_SINGLE_SHOT_MEASUREMENT(self, gcmd):
+    range_value, error_description = self.single_shot_measurement()
+    
+    if range_value is None:
+        self.gcode.respond_info(f'Single shot measurement failed: {error_description}')
+    elif error_description:
+        self.gcode.respond_info(f'Single shot measurement: {range_value} mm (Warning: {error_description})')
+    else:
+        self.gcode.respond_info(f'Single shot measurement: {range_value} mm')
 
   def cmd_DIAG_VL_SENSOR(self, gcmd):
-
-    # Identification registers
-    self.gcode.respond_info('IDENTIFICATION__MODEL_ID: %s' % hex(int(self.get_register(self.IDENTIFICATION__MODEL_ID))))
-    self.gcode.respond_info('IDENTIFICATION__MODEL_REV_MAJOR: %s' % hex(int(self.get_register(self.IDENTIFICATION__MODEL_REV_MAJOR))))
-    self.gcode.respond_info('IDENTIFICATION__MODEL_REV_MINOR: %s' % hex(int(self.get_register(self.IDENTIFICATION__MODEL_REV_MINOR))))
-    self.gcode.respond_info('IDENTIFICATION__MODULE_REV_MAJOR: %s' % hex(int(self.get_register(self.IDENTIFICATION__MODULE_REV_MAJOR))))
-    self.gcode.respond_info('IDENTIFICATION__MODULE_REV_MINOR %s' % hex(int(self.get_register(self.IDENTIFICATION__MODULE_REV_MINOR))))
-    self.gcode.respond_info('IDENTIFICATION__DATE_HI: %s' % hex(int(self.get_register(self.IDENTIFICATION__DATE_HI))))
-    self.gcode.respond_info('IDENTIFICATION__DATE_LO: %s' % hex(int(self.get_register(self.IDENTIFICATION__DATE_LO))))
-    self.gcode.respond_info('IDENTIFICATION__TIME: %s' % hex(int(self.get_register(self.IDENTIFICATION__TIME))))
-
-    # System registers
-    self.gcode.respond_info('SYSTEM__MODE_GPIO0: %s' % hex(int(self.get_register(self.SYSTEM__MODE_GPIO0))))
-    self.gcode.respond_info('SYSTEM__MODE_GPIO1: %s' % hex(int(self.get_register(self.SYSTEM__MODE_GPIO1))))
-    self.gcode.respond_info('SYSTEM__HISTORY_CTRL: %s' % hex(int(self.get_register(self.SYSTEM__HISTORY_CTRL))))
-    self.gcode.respond_info('SYSTEM__INTERRUPT_CONFIG_GPIO: %s' % hex(int(self.get_register(self.SYSTEM__INTERRUPT_CONFIG_GPIO))))
-    self.gcode.respond_info('SYSTEM__INTERRUPT_CLEAR: %s' % hex(int(self.get_register(self.SYSTEM__INTERRUPT_CLEAR))))
-    self.gcode.respond_info('SYSTEM__FRESH_OUT_OF_RESET: %s' % hex(int(self.get_register(self.SYSTEM__FRESH_OUT_OF_RESET))))
-    self.gcode.respond_info('SYSTEM__GROUPED_PARAMETER_HOLD: %s' % hex(int(self.get_register(self.SYSTEM__GROUPED_PARAMETER_HOLD))))
+    # Get all register constants from the class
+    registers = {name: value for name, value in vars(self.__class__).items() 
+                if isinstance(value, int) and not name.startswith('_')}
     
-    # Measurement registers
-    self.gcode.respond_info('SYSRANGE__START: %s' % hex(int(self.get_register(self.SYSRANGE__START))))
-    self.gcode.respond_info('SYSRANGE__THRESH_HIGH: %s' % hex(int(self.get_register(self.SYSRANGE__THRESH_HIGH))))
-    self.gcode.respond_info('SYSRANGE__THRESH_LOW: %s' % hex(int(self.get_register(self.SYSRANGE__THRESH_LOW))))
-    self.gcode.respond_info('SYSRANGE__INTERMEASUREMENT_PERIOD: %s' % hex(int(self.get_register(self.SYSRANGE__INTERMEASUREMENT_PERIOD))))
-    self.gcode.respond_info('SYSRANGE__MAX_CONVERGENCE_TIME: %s' % hex(int(self.get_register(self.SYSRANGE__MAX_CONVERGENCE_TIME))))
-    self.gcode.respond_info('SYSRANGE__CROSSTALK_COMPENSATION_RATE: %s' % hex(int(self.get_register(self.SYSRANGE__CROSSTALK_COMPENSATION_RATE))))
-    self.gcode.respond_info('SYSRANGE__CROSSTALK_VALID_HEIGHT: %s' % hex(int(self.get_register(self.SYSRANGE__CROSSTALK_VALID_HEIGHT))))
-    self.gcode.respond_info('SYSRANGE__EARLY_CONVERGENCE_ESTIMATE: %s' % hex(int(self.get_register(self.SYSRANGE__EARLY_CONVERGENCE_ESTIMATE))))
-    self.gcode.respond_info('SYSRANGE__PART_TO_PART_RANGE_OFFSET: %s' % hex(int(self.get_register(self.SYSRANGE__PART_TO_PART_RANGE_OFFSET))))
-    self.gcode.respond_info('SYSRANGE__RANGE_IGNORE_VALID_HEIGHT: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_IGNORE_VALID_HEIGHT))))
-    self.gcode.respond_info('SYSRANGE__RANGE_IGNORE_THRESHOLD: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_IGNORE_THRESHOLD))))
-    self.gcode.respond_info('SYSRANGE__MAX_AMBIENT_LEVEL_MULT: %s' % hex(int(self.get_register(self.SYSRANGE__MAX_AMBIENT_LEVEL_MULT))))
-    self.gcode.respond_info('SYSRANGE__RANGE_CHECK_ENABLES: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_CHECK_ENABLES))))
-    self.gcode.respond_info('SYSRANGE__VHV_RECALIBRATE: %s' % hex(int(self.get_register(self.SYSRANGE__VHV_RECALIBRATE))))
-    self.gcode.respond_info('SYSRANGE__VHV_REPEAT_RATE: %s' % hex(int(self.get_register(self.SYSRANGE__VHV_REPEAT_RATE))))
-    self.gcode.respond_info('SYSRANGE__MAX_CONVERGENCE_TIME: %s' % hex(int(self.get_register(self.SYSRANGE__MAX_CONVERGENCE_TIME))))
-    self.gcode.respond_info('SYSRANGE__CROSSTALK_COMPENSATION_RATE: %s' % hex(int(self.get_register(self.SYSRANGE__CROSSTALK_COMPENSATION_RATE))))
-    self.gcode.respond_info('SYSRANGE__CROSSTALK_VALID_HEIGHT: %s' % hex(int(self.get_register(self.SYSRANGE__CROSSTALK_VALID_HEIGHT))))
-    self.gcode.respond_info('SYSRANGE__EARLY_CONVERGENCE_ESTIMATE: %s' % hex(int(self.get_register(self.SYSRANGE__EARLY_CONVERGENCE_ESTIMATE))))
-    self.gcode.respond_info('SYSRANGE__PART_TO_PART_RANGE_OFFSET: %s' % hex(int(self.get_register(self.SYSRANGE__PART_TO_PART_RANGE_OFFSET))))
-    self.gcode.respond_info('SYSRANGE__RANGE_IGNORE_VALID_HEIGHT: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_IGNORE_VALID_HEIGHT))))
-    self.gcode.respond_info('SYSRANGE__RANGE_IGNORE_THRESHOLD: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_IGNORE_THRESHOLD))))
-    self.gcode.respond_info('SYSRANGE__MAX_AMBIENT_LEVEL_MULT: %s' % hex(int(self.get_register(self.SYSRANGE__MAX_AMBIENT_LEVEL_MULT))))
-    self.gcode.respond_info('SYSRANGE__RANGE_CHECK_ENABLES: %s' % hex(int(self.get_register(self.SYSRANGE__RANGE_CHECK_ENABLES))))
+    # Sort by register address for logical output order
+    sorted_registers = sorted(registers.items(), key=lambda x: x[1])
     
-    # Result registers
-    self.gcode.respond_info('RESULT__RANGE_STATUS: %s' % hex(int(self.get_register(self.RESULT__RANGE_STATUS))))
-    self.gcode.respond_info('RESULT__INTERRUPT_STATUS_GPIO: %s' % hex(int(self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO))))
-    self.gcode.respond_info('RESULT__HISTORY_BUFFER_x: %s' % hex(int(self.get_register(self.RESULT__HISTORY_BUFFER_x))))
-    self.gcode.respond_info('RESULT__RANGE_VAL: %s' % hex(int(self.get_register(self.RESULT__RANGE_VAL))))
-    self.gcode.respond_info('RESULT__RANGE_RAW: %s' % hex(int(self.get_register(self.RESULT__RANGE_RAW))))
-    self.gcode.respond_info('RESULT__RANGE_RETURN_RATE: %s' % hex(int(self.get_register(self.RESULT__RANGE_RETURN_RATE))))
-    self.gcode.respond_info('RESULT__RANGE_REFERENCE_RATE: %s' % hex(int(self.get_register(self.RESULT__RANGE_REFERENCE_RATE))))
-    self.gcode.respond_info('RESULT__RANGE_RETURN_SIGNAL_COUNT: %s' % hex(int(self.get_register(self.RESULT__RANGE_RETURN_SIGNAL_COUNT))))
-    self.gcode.respond_info('RESULT__RANGE_REFERENCE_SIGNAL_COUNT: %s' % hex(int(self.get_register(self.RESULT__RANGE_REFERENCE_SIGNAL_COUNT))))
-    self.gcode.respond_info('RESULT__RANGE_RETURN_AMB_COUNT: %s' % hex(int(self.get_register(self.RESULT__RANGE_RETURN_AMB_COUNT))))
-    self.gcode.respond_info('RESULT__RANGE_REFERENCE_AMB_COUNT: %s' % hex(int(self.get_register(self.RESULT__RANGE_REFERENCE_AMB_COUNT))))
-    self.gcode.respond_info('RESULT__RANGE_RETURN_CONV_TIME: %s' % hex(int(self.get_register(self.RESULT__RANGE_RETURN_CONV_TIME))))
-    self.gcode.respond_info('RESULT__RANGE_REFERENCE_CONV_TIME: %s' % hex(int(self.get_register(self.RESULT__RANGE_REFERENCE_CONV_TIME))))
-    
-    # Other registers
-    self.gcode.respond_info('READOUT__AVERAGING_SAMPLE_PERIOD: %s' % hex(int(self.get_register(self.READOUT__AVERAGING_SAMPLE_PERIOD))))
-    self.gcode.respond_info('FIRMWARE__BOOTUP: %s' % hex(int(self.get_register(self.FIRMWARE__BOOTUP))))
-    self.gcode.respond_info('I2C_SLAVE__DEVICE_ADDRESS: %s' % hex(int(self.get_register(self.I2C_SLAVE__DEVICE_ADDRESS))))
+    for reg_name, reg_addr in sorted_registers:
+      try:
+        reg_value = self.get_register(reg_addr)
+        self.gcode.respond_info('%s: %s' % (reg_name, hex(reg_value)))
+      except Exception as e:
+        self.gcode.respond_info('%s: Error reading register - %s' % (reg_name, str(e)))
 
+  def cmd_GET_VL_OFFSET(self, gcmd):
+        offset = self.get_offset_calibration_data()
+        # Convert from 2s complement to signed value for display
+        offset_signed = offset if offset < 128 else offset - 256
+        self.gcode.respond_info(f'Current VL sensor offset: {offset_signed}mm (register: 0x{offset:02x})')
+        
+  def cmd_SET_VL_OFFSET(self, gcmd):
+        offset = gcmd.get_int('OFFSET', 0)
+        if offset > 127 or offset < -128:
+            self.gcode.respond_info('Error: Offset must be between -128 and +127')
+            return
+        # Convert to register value (2s complement if negative)
+        register_value = offset if offset >= 0 else 256 + offset
+        self.set_offset_calibration(register_value)
+        self.gcode.respond_info(f'Set VL sensor offset to: {offset}mm (register: 0x{register_value:02x})')
+
+  def cmd_CALIBRATE_VL_OFFSET(self, gcmd):
+    target_distance = gcmd.get_float('DISTANCE', 50.0)
+    num_samples = gcmd.get_int('SAMPLES', 10)
+    
+    if num_samples < 1:
+        self.gcode.respond_info('Error: SAMPLES must be at least 1')
+        return
+        
+    self.gcode.respond_info(f'Starting offset calibration at {target_distance}mm with {num_samples} samples')
+    self.gcode.respond_info('Make sure target is placed at the specified distance with 17%+ reflectance')
+    
+    # Step 1: Get and clear the current system offset
+    old_offset_reg = self.get_offset_calibration_data()
+    # Convert from 2s complement to signed value for display
+    old_offset_signed = old_offset_reg if old_offset_reg < 128 else old_offset_reg - 256
+    self.gcode.respond_info(f'Current offset: {old_offset_signed}mm (register: 0x{old_offset_reg:02x})')
+    
+    self.set_offset_calibration(0)
+    self.gcode.respond_info('Cleared existing offset calibration')
+    
+    # Step 2 & 3: Collect measurements and calculate mean
+    measurements = []
+    failed_measurements = 0
+    
+    for i in range(num_samples):
+        range_value, error_description = self.single_shot_measurement()
+        
+        if range_value is not None:
+            measurements.append(range_value)
+            self.gcode.respond_info(f'Sample {i+1}/{num_samples}: {range_value}mm')
+        else:
+            failed_measurements += 1
+            self.gcode.respond_info(f'Sample {i+1}/{num_samples}: Failed - {error_description}')
+    
+    if len(measurements) == 0:
+        self.gcode.respond_info('Error: All measurements failed. Check sensor and target setup.')
+        return
+    
+    if failed_measurements > 0:
+        self.gcode.respond_info(f'Warning: {failed_measurements} measurements failed')
+    
+    # Calculate mean
+    mean_measurement = sum(measurements) / len(measurements)
+    self.gcode.respond_info(f'Mean measurement: {mean_measurement:.2f}mm')
+    
+    # Step 4: Calculate the offset required
+    offset_required = target_distance - mean_measurement
+    self.gcode.respond_info(f'Calculated offset: {offset_required:.2f}mm')
+    
+    # Convert to integer and handle 2's complement representation
+    offset_int = int(round(offset_required))
+    
+    # Clamp to valid range (-128 to +127)
+    if offset_int > 127:
+        offset_int = 127
+        self.gcode.respond_info('Warning: Offset clamped to maximum value of +127')
+    elif offset_int < -128:
+        offset_int = -128
+        self.gcode.respond_info('Warning: Offset clamped to minimum value of -128')
+    
+    # Convert to 2's complement representation for register
+    if offset_int >= 0:
+        register_value = offset_int
+    else:
+        register_value = 256 + offset_int  # Convert negative to 2's complement
+    
+    # Step 5: Apply offset and show the change
+    self.set_offset_calibration(register_value)
+    offset_change = offset_int - old_offset_signed
+    self.gcode.respond_info(f'Offset changed: {old_offset_signed}mm -> {offset_int}mm (change: {offset_change:+d}mm)')
+    self.gcode.respond_info(f'Register value: 0x{old_offset_reg:02x} -> 0x{register_value:02x}')
+    
+    # Verify calibration with a test measurement
+    self.gcode.respond_info('Verifying calibration...')
+    test_range, test_error = self.single_shot_measurement()
+    if test_range is not None:
+        error_after_cal = abs(test_range - target_distance)
+        self.gcode.respond_info(f'Verification measurement: {test_range}mm (error: {error_after_cal:.2f}mm)')
+        if error_after_cal <= 2.0:  # Within 2mm tolerance
+            self.gcode.respond_info('Calibration completed successfully!')
+        else:
+            self.gcode.respond_info('Warning: Calibration may need adjustment or target repositioning')
+    else:
+        self.gcode.respond_info(f'Verification failed: {test_error}')
 
 def load_config_prefix(config):
     return vl6180(config)
