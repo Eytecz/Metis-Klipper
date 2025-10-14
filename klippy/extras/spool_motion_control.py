@@ -95,16 +95,50 @@ class SpoolMotionControl:
         self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
    
     def cmd_SPOOL_MOTION_CONTROL(self, gcmd):
-        self.enable_tracking = not self.enable_tracking
-        logging.info(f'self.enable_tracking set to {self.enable_tracking}')
-    
+        # Parse parameters
+        enable = gcmd.get('ENABLE', None)
+        assist_forward = gcmd.get('ASSIST_FORWARD', None)
+        assist_reverse = gcmd.get('ASSIST_REVERSE', None)
+        threshold = gcmd.get('THRESHOLD', None)
+        
+        # Update tracking state
+        if enable is not None:
+            self.enable_tracking = gcmd.get_int('ENABLE', self.enable_tracking, minval=0, maxval=1)
+            gcmd.respond_info(f"Spool tracking {'enabled' if self.enable_tracking else 'disabled'}")
+        
+        # Update assist directions
+        if assist_forward is not None:
+            self.assist_forward = gcmd.get_int('ASSIST_FORWARD', self.assist_forward, minval=0, maxval=1)
+            gcmd.respond_info(f"Forward assist {'enabled' if self.assist_forward else 'disabled'}")
+            
+        if assist_reverse is not None:
+            self.assist_reverse = gcmd.get_int('ASSIST_REVERSE', self.assist_reverse, minval=0, maxval=1)
+            gcmd.respond_info(f"Reverse assist {'enabled' if self.assist_reverse else 'disabled'}")
+        
+        # Update threshold
+        if threshold is not None:
+            self.assist_threshold = gcmd.get_float('THRESHOLD', self.assist_threshold, minval=0.0)
+            gcmd.respond_info(f"Assist threshold set to {self.assist_threshold:.1f}mm")
+        
+        # If no parameters provided, show current status
+        if all(param is None for param in [enable, assist_forward, assist_reverse, threshold]):
+            gcmd.respond_info(f"Spool Motion Control Status:")
+            gcmd.respond_info(f"  Tracking: {'enabled' if self.enable_tracking else 'disabled'}")
+            gcmd.respond_info(f"  Forward assist: {'enabled' if self.assist_forward else 'disabled'}")
+            gcmd.respond_info(f"  Reverse assist: {'enabled' if self.assist_reverse else 'disabled'}")
+            gcmd.respond_info(f"  Assist threshold: {self.assist_threshold:.1f}mm")
+            gcmd.respond_info(f"  Moved distance: {self.moved_distance:.1f}mm")
+
     def cmd_MEASURE_SPOOL_DIAMETER(self, gcmd):
         if not self.spool_measurement or not hasattr(self, 'vl6180'):
             gcmd.respond_info("Spool measurement or VL6180 sensor not enabled.")
             return
         diameter = self.estimate_spool_diameter()
-        gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f} mm")
-    
+        if diameter is None:
+            gcmd.respond_info("Failed to measure spool diameter - sensor error or no spool detected")
+        else:
+            gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f} mm")
+
     def _trapq_append_intercept(self, *args):
         logging.info(f'_trapq_append_intercept with args: {args}')
         self.trapq_append_original(*args)
@@ -166,19 +200,27 @@ class SpoolMotionControl:
         self.hbridge_motor.scheduled_async_motion(pwm_value, print_time, runtime)
 
     def estimate_spool_diameter(self):
-        if self.spool_measurement and self.vl6180:
-            measurement = self.vl6180.single_range_measurement()
-            if measurement == 255.0:
-                logging.info(f'No spool detected')
-                return 
-            if measurement < 255.0:
-                value = (self.vl6180_center_distance - measurement) * 2
-                value = max(self.spool_diameter[0], min(value, self.spool_diameter[1]))
-                logging.info(f'Estimated spool diameter: {value} mm based on measurement: {measurement} mm')
-                return value
-            else:
-                logging.warning('VL6180 sensor did not return a valid measurement')
-                return self.spool_diameter[1]
+        if not self.spool_measurement or not hasattr(self, 'vl6180'):
+            return None
+        
+        try:
+            range_value, error_description = self.vl6180.single_shot_measurement()
+            
+            if error_description is not None:
+                logging.warning(f'VL6180 {self.name} measurement error: {error_description}')
+                if error_description == "Max Convergence":
+                    logging.info(f'No spool detected for spool slot {self.name}')
+                return None
+            
+            calculated_diameter = (self.vl6180_center_distance - range_value) * 2
+            spool_diameter = max(self.spool_diameter[0], 
+                               min(calculated_diameter, self.spool_diameter[1]))
+            
+            return spool_diameter
+            
+        except Exception as e:
+            logging.error(f'Failed to measure spool diameter for {self.name}: {e}')
+            return None
 
 
 def load_config_prefix(config):
