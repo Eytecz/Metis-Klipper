@@ -47,7 +47,7 @@ class SpoolMotionControl:
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.24, minval=0.1)  # g/cm³, PLA default
         self.filament_diameter = config.getfloat('filament_diameter', 1.75, minval=0.1)  # mm
-        self.spool_width = config.getfloat('spool_width', 65.0, minval=1.0)  # mm
+        self.spool_width = config.getfloat('spool_width', 60.0, minval=1.0)  # mm
         # Packing efficiency factor to account for voids between wound filament layers
         # Typical values: 0.85-0.95 for machine-wound spools, 0.75-0.85 for hand-wound
         self.packing_efficiency = config.getfloat('packing_efficiency', 0.95, minval=0.5, maxval=1.0)
