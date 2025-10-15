@@ -6,7 +6,6 @@
 
 from . import bus
 import codecs
-import timeit
 import logging
 
 class EnableHelper:
@@ -83,9 +82,8 @@ class vl6180:
   FIRMWARE__BOOTUP                      = 0x0119
   I2C_SLAVE__DEVICE_ADDRESS             = 0x0212
 
-  # Add timeout constant
   MEASUREMENT_TIMEOUT_MS = 1000
-  POLLING_DELAY_US = 1000
+  POLLING_DELAY_MS = 1
 
   def __init__(self, config):
     self.config = config
@@ -99,6 +97,7 @@ class vl6180:
     self.i2c_slave_address = config.getint('i2c_slave_address', None)
     if self.i2c_slave_address:
       self.i2c = bus.MCU_I2C_from_config(self.config, self.i2c_slave_address, default_speed=100000)
+    self.part_to_part_range_offset = config.getint('part_to_part_range_offset', None)
 
     self.gcode = self.printer.lookup_object('gcode')
     self.gcode.register_mux_command('SINGLE_SHOT_MEASUREMENT', 'SENSOR', self.name,
@@ -180,6 +179,10 @@ class vl6180:
     self.set_register(0x001b, 0x09)   # Set default ranging inter-measurement period to 100ms
     self.set_register(0x0014, 0x24)   # Configures interrupt on 'New Sample Ready threshold event'
 
+    # Set offset value correctly
+    if self.part_to_part_range_offset:
+      self.set_register(self.SYSRANGE__PART_TO_PART_RANGE_OFFSET, self.part_to_part_range_offset & 0xFF)
+
   def set_register(self, register, data):
     reg_high = (register >> 8) & 0xFF
     reg_low = register & 0xFF
@@ -198,64 +201,77 @@ class vl6180:
     val = self.i2c.i2c_read([register_high, register_low], 1)
     return int(codecs.encode(val['response'], 'hex'), 16)
   
-  def delay(self, us):
-    start_time = timeit.default_timer()
-    while (timeit.default_timer() - start_time) * 1e6 < us:
-      pass
+  def delay_ms(self, ms):
+    curtime = self.reactor.monotonic()
+    waketime = curtime + ms * 0.001
+    self.reactor.pause(waketime)
+
+  def format_macro(self, macro: str) -> str:
+    return f'<a class="command">{macro}</a>'
 
   def single_shot_measurement(self):
-    # Step 1: Check device is ready to start a range measurement (Optional)
-    range_status = self.get_register(self.RESULT__RANGE_STATUS)
-    if not (range_status & 0x01):
-        logging.info('Device not ready for range measurement')
-        return None, "Device not ready"
-    
-    # Step 2: Start a range measurement
-    self.set_register(self.SYSRANGE__START, 0x01)
-    
-    # Step 3: Wait for range measurement to complete
-    timeout_counter = 0
-    max_timeout = self.MEASUREMENT_TIMEOUT_MS  # Use class constant
-    
-    while True:
-        interrupt_status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
-        
-        # Check for errors first
-        error_value = (interrupt_status >> 6) & 0b11
-        if error_value != 0:
-            error_description, _ = self.interrupt_status_lookup(interrupt_status)
-            logging.info(f'Error during measurement: {error_description}')
-            self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
-            return None, error_description
-        
-        # Check for threshold events
-        range_event = interrupt_status & 0b111
-        if range_event == 4:  # New Sample Ready threshold event
-            break
-        
-        # Add timeout protection
-        timeout_counter += 1
-        if timeout_counter > max_timeout:
-            logging.info('Measurement timeout')
-            self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
-            return None, "Measurement timeout"
-        
-        self.delay(self.POLLING_DELAY_US)  # Use class constant
-    
-    # Step 4: Reading range result
-    range_value = self.get_register(self.RESULT__RANGE_VAL)
+    try:
+      # Step 1: Check device is ready to start a range measurement (Optional)
+      range_status = self.get_register(self.RESULT__RANGE_STATUS)
+      if not (range_status & 0x01):
+          logging.info('Device not ready for range measurement')
+          return None, "Device not ready"
+      
+      # Step 2: Start a range measurement
+      self.set_register(self.SYSRANGE__START, 0x01)
+      
+      # Step 3: Wait for range measurement to complete
+      start_time = self.reactor.monotonic()
+      timeout_seconds = self.MEASUREMENT_TIMEOUT_MS * 0.001  # Convert to seconds
+      
+      while True:
+          interrupt_status = self.get_register(self.RESULT__INTERRUPT_STATUS_GPIO)
+          
+          # Check for errors first
+          error_value = (interrupt_status >> 6) & 0b11
+          if error_value != 0:
+              error_description, _ = self.interrupt_status_lookup(interrupt_status)
+              logging.info(f'Error during measurement: {error_description}')
+              self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+              return None, error_description
+          
+          # Check for threshold events
+          range_event = interrupt_status & 0b111
+          if range_event == 4:  # New Sample Ready threshold event
+              break
+          
+          # Check timeout using reactor time
+          current_time = self.reactor.monotonic()
+          if (current_time - start_time) > timeout_seconds:
+              logging.info('Measurement timeout')
+              self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+              return None, "Measurement timeout"
+          
+          # Use reactor delay
+          self.delay_ms(self.POLLING_DELAY_MS)
+      
+      # Step 4: Reading range result
+      range_value = self.get_register(self.RESULT__RANGE_VAL)
 
-    # Step 5: Check result range status for any warnings or errors
-    error_description = None
-    range_status = self.get_register(self.RESULT__RANGE_STATUS)
-    if (range_status >> 4) & 0x0F != 0:
-        error_description = self.result_range_status_lookup(range_status)
-        logging.info(f'Warning in range status: {error_description}')
+      # Step 5: Check result range status for any warnings or errors
+      error_description = None
+      range_status = self.get_register(self.RESULT__RANGE_STATUS)
+      if (range_status >> 4) & 0x0F != 0:
+          error_description = self.result_range_status_lookup(range_status)
+          logging.info(f'Warning in range status: {error_description}')
 
-    # Step 6: Clear the Interrupt status
-    self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
-    
-    return range_value, error_description
+      # Step 6: Clear the Interrupt status
+      self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+      
+      return range_value, error_description
+
+    except Exception as e:
+        logging.error(f'Exception in single_shot_measurement: {e}')
+        try:
+            self.set_register(self.SYSTEM__INTERRUPT_CLEAR, 0x07)
+        except:
+            pass 
+        return None, f"Communication error: {str(e)}"
 
   def interrupt_status_lookup(self, status):
     error_value = (status >> 6) & 0b11
@@ -336,20 +352,20 @@ class vl6180:
         self.gcode.respond_info('%s: Error reading register - %s' % (reg_name, str(e)))
 
   def cmd_GET_VL_OFFSET(self, gcmd):
-        offset = self.get_offset_calibration_data()
-        # Convert from 2s complement to signed value for display
-        offset_signed = offset if offset < 128 else offset - 256
-        self.gcode.respond_info(f'Current VL sensor offset: {offset_signed}mm (register: 0x{offset:02x})')
+    offset = self.get_offset_calibration_data()
+    # Convert from 2s complement to signed value for display
+    offset_signed = offset if offset < 128 else offset - 256
+    self.gcode.respond_info(f'Current VL sensor offset: {offset_signed}mm (register: 0x{offset:02x})')
         
   def cmd_SET_VL_OFFSET(self, gcmd):
-        offset = gcmd.get_int('OFFSET', 0)
-        if offset > 127 or offset < -128:
-            self.gcode.respond_info('Error: Offset must be between -128 and +127')
-            return
-        # Convert to register value (2s complement if negative)
-        register_value = offset if offset >= 0 else 256 + offset
-        self.set_offset_calibration(register_value)
-        self.gcode.respond_info(f'Set VL sensor offset to: {offset}mm (register: 0x{register_value:02x})')
+    offset = gcmd.get_int('OFFSET', 0)
+    if offset > 127 or offset < -128:
+        self.gcode.respond_info('Error: Offset must be between -128 and +127')
+        return
+    # Convert to register value (2s complement if negative)
+    register_value = offset if offset >= 0 else 256 + offset
+    self.set_offset_calibration(register_value)
+    self.gcode.respond_info(f'Set VL sensor offset to: {offset}mm (register: 0x{register_value:02x})')
 
   def cmd_CALIBRATE_VL_OFFSET(self, gcmd):
     target_distance = gcmd.get_float('DISTANCE', 50.0)
@@ -419,6 +435,7 @@ class vl6180:
     
     # Step 5: Apply offset and show the change
     self.set_offset_calibration(register_value)
+    self.part_to_part_range_offset = register_value
     offset_change = offset_int - old_offset_signed
     self.gcode.respond_info(f'Offset changed: {old_offset_signed}mm -> {offset_int}mm (change: {offset_change:+d}mm)')
     self.gcode.respond_info(f'Register value: 0x{old_offset_reg:02x} -> 0x{register_value:02x}')
@@ -431,6 +448,11 @@ class vl6180:
         self.gcode.respond_info(f'Verification measurement: {test_range}mm (error: {error_after_cal:.2f}mm)')
         if error_after_cal <= 2.0:  # Within 2mm tolerance
             self.gcode.respond_info('Calibration completed successfully!')
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set(f'vl6180 {self.name}', 'part_to_part_range_offset', str(register_value))
+            gcmd.respond_info(
+                f"Calibration completed successfully! Please use {self.format_macro('SAVE_CONFIG')} to save the calibration value."
+            )
         else:
             self.gcode.respond_info('Warning: Calibration may need adjustment or target repositioning')
     else:
