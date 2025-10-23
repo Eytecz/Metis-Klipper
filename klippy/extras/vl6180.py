@@ -365,7 +365,10 @@ class vl6180:
     # Convert to register value (2s complement if negative)
     register_value = offset if offset >= 0 else 256 + offset
     self.set_offset_calibration(register_value)
-    self.gcode.respond_info(f'Set VL sensor offset to: {offset}mm (register: 0x{register_value:02x})')
+    
+    configfile = self.printer.lookup_object('configfile')
+    configfile.set(f'vl6180 {self.name}', 'part_to_part_range_offset', str(register_value))
+    gcmd.respond_info(f"Offset set to {offset}mm, with register value 0x{register_value:02x}! Please use {self.format_macro('SAVE_CONFIG')} to save the calibration value.")
 
   def cmd_CALIBRATE_VL_OFFSET(self, gcmd):
     target_distance = gcmd.get_float('DISTANCE', 50.0)

@@ -245,7 +245,6 @@ class SpoolMotionControl:
         
         return filament_length_m, mass_g
 
-
     def cmd_SPOOL_MOTION_CONTROL(self, gcmd):
         # Parse parameters
         enable = gcmd.get('ENABLE', None)
