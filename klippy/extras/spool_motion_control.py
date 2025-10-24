@@ -45,12 +45,10 @@ class SpoolMotionControl:
             self.measurement_samples = config.getint('measurement_samples', 10, minval=1, maxval=20)
         
         # Material and spool properties for content estimation
-        self.material_density = config.getfloat('material_density', 1.24, minval=0.1)  # g/cm³, PLA default
-        self.filament_diameter = config.getfloat('filament_diameter', 1.75, minval=0.1)  # mm
-        self.spool_width = config.getfloat('spool_width', 60.0, minval=1.0)  # mm
-        # Packing efficiency factor to account for voids between wound filament layers
-        # Typical values: 0.85-0.95 for machine-wound spools, 0.75-0.85 for hand-wound
-        self.packing_efficiency = config.getfloat('packing_efficiency', 0.95, minval=0.5, maxval=1.0)
+        self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
+        self.filament_diameter = config.getfloat('filament_diameter', 1.75, minval=0.1)
+        self.spool_width = config.getfloat('spool_width', 56.0, minval=1.0)
+        self.packing_efficiency = config.getfloat('packing_efficiency', 0.80, minval=0.5, maxval=1.0)
 
         # Register g-code commands
         self.gcode.register_mux_command('SPOOL_MOTION_CONTROL', 'SPOOL', self.name,
@@ -308,8 +306,6 @@ class SpoolMotionControl:
         gcmd.respond_info(f"  Filament length: {length_m:.2f} meters")
         gcmd.respond_info(f"  Filament mass: {mass_g:.1f} grams")
         gcmd.respond_info(f"  Parameters used: density={density:.2f}g/cm³, width={width:.1f}mm, filament_dia={filament_dia:.2f}mm, packing_eff={packing_eff:.2f}")
-
-
 
 def load_config_prefix(config):
     return SpoolMotionControl(config)
