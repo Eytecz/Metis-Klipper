@@ -9,6 +9,12 @@ import configparser
 from configfile import ConfigWrapper
 from .led_effect import ledEffect
 
+STATUS_ERROR        = 'error'           # Critical fault
+STATUS_BUSY         = 'busy'            # In transition/movement
+STATUS_EMPTY        = 'empty'           # No spool detected
+STATUS_IDLE         = 'idle'            # Can be loaded if required
+STATUS_READY        = 'ready'           # Ready for printing
+
 class SpoolManager:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -35,23 +41,21 @@ class SpoolManager:
             self.status_led = True
             self.frame_rate = config.getfloat('frame_rate', default=24, minval=1, maxval=60)
             self.state_layers = {
-                'empty': config.get('state_layer_empty', None),
-                'ready': config.get('state_layer_ready', None),
-                'changing': config.get('state_layer_changing', None),
-                'loaded': config.get('state_layer_loaded', None),
-                'error': config.get('state_layer_error', None)
+                STATUS_EMPTY: config.get('state_layer_empty', None),
+                STATUS_READY: config.get('state_layer_ready', None),
+                STATUS_BUSY: config.get('state_layer_busy', None),
+                STATUS_IDLE: config.get('state_layer_idle', None),
+                STATUS_ERROR: config.get('state_layer_error', None)
             }
         
         # Register commands
-    
-    def get_state_layer(self, state):
-        return self.state_layers.get(state, None)
 
     def handle_connect(self):
         for object in self.printer.lookup_objects('spool_unit'):
             name = object[1].get_name()   
             self.spool_units[name] = object[1]
-            self._create_led_configs(name)          
+            if self.status_led:
+                self._create_led_configs(name)          
 
     def handle_ready(self):
         pass
