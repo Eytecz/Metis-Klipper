@@ -245,6 +245,12 @@ class SpoolUnit:
         
         return filament_length_m, mass_g
 
+    def get_name(self):
+        return self.name
+
+    def get_status_leds(self):
+        return self.status_leds
+
     def cmd_SPOOL_MOTION_CONTROL(self, gcmd):
         # Parse parameters
         enable = gcmd.get('ENABLE', None)
