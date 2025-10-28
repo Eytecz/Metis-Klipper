@@ -42,7 +42,6 @@ class SpoolManager:
                 'error': config.get('state_layer_error', None)
             }
         
-
         # Register commands
     
     def get_state_layer(self, state):
@@ -62,7 +61,6 @@ class SpoolManager:
         pass
     
     def create_led_effect_config(self, effect_name, effect_config):
-        """Create a ConfigWrapper for led_effect with the specified configuration"""
         # Create a new configparser with the led effect configuration
         fileconfig = configparser.RawConfigParser()
         section_name = f"led_effect {effect_name}"
@@ -80,24 +78,21 @@ class SpoolManager:
             section_name
         )
         
-        logging.info("SpoolManager: Created LED effect config for '%s'", effect_name)
         return config_wrapper
         
     def create_state_led_configs(self, spool_unit_name):
-        """Create LED effect configs for all states for a spool unit"""
         if not self.status_led or spool_unit_name not in self.spool_units:
             return
-            
         spool_unit = self.spool_units[spool_unit_name]
         led_pins = spool_unit.get_status_leds()
-        
+
         configs = {}
-        
+    
         # Create config for each state that has a defined layer
         for state, state_layer in self.state_layers.items():
-            if state_layer:  # Only create config if state layer is defined
+            if state_layer:
                 effect_config = {
-                    'auto_start': 'true',
+                    'auto_start': 'False',
                     'frame_rate': str(self.frame_rate),
                     'layers': state_layer,
                     'leds': led_pins
@@ -107,15 +102,11 @@ class SpoolManager:
                 config = self.create_led_effect_config(effect_name, effect_config)
                 configs[state] = config
                 
-                # Create and register the led_effect object properly
                 try:
                     led_effect_obj = self.printer.load_object(config, 'led_effect')
-                    # Register the object in the printer's object system
                     full_name = f"led_effect {effect_name}"
                     self.printer.add_object(full_name, led_effect_obj)
-                    obj = self.printer.lookup_object(full_name)
                     ledEffect(config)
-                    logging.info("SpoolManager: Created and registered LED effect '%s', on object %s", effect_name, obj)
                 except Exception as e:
                     logging.error("SpoolManager: Failed to create LED effect '%s': %s", effect_name, e)
         
