@@ -1,4 +1,4 @@
-# Automated control of spool motion functionality
+# Collection of spool unit related functions
 #
 # Copyright (C) 2025 Eytecz
 #
@@ -7,7 +7,7 @@
 import math
 import logging
 
-class SpoolMotionControl:
+class SpoolUnit:
     def __init__(self, config):
         self.config = config
         self.printer = self.config.get_printer()
@@ -43,7 +43,9 @@ class SpoolMotionControl:
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
             self.measurement_samples = config.getint('measurement_samples', 10, minval=1, maxval=20)
-        
+        self.status_leds = config.get('status_leds', None)
+
+
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
         self.filament_diameter = config.getfloat('filament_diameter', 1.75, minval=0.1)
@@ -271,20 +273,20 @@ class SpoolMotionControl:
         
         # If no parameters provided, show current status
         if all(param is None for param in [enable, assist_forward, assist_reverse, threshold]):
-            gcmd.respond_info(f"Spool Motion Control Status:")
-            gcmd.respond_info(f"  Tracking: {'enabled' if self.enable_tracking else 'disabled'}")
-            gcmd.respond_info(f"  Forward assist: {'enabled' if self.assist_forward else 'disabled'}")
-            gcmd.respond_info(f"  Reverse assist: {'enabled' if self.assist_reverse else 'disabled'}")
-            gcmd.respond_info(f"  Assist threshold: {self.assist_threshold:.1f}mm")
-            gcmd.respond_info(f"  Moved distance: {self.moved_distance:.1f}mm")
+            status_msg = (f"Motion control for {self.name}: "
+                         f"tracking={'enabled' if self.enable_tracking else 'disabled'}, "
+                         f"forward_assist={'enabled' if self.assist_forward else 'disabled'}, "
+                         f"reverse_assist={'enabled' if self.assist_reverse else 'disabled'}, "
+                         f"assist_threshold={self.assist_threshold:.1f}mm")
+            gcmd.respond_info(status_msg)
 
     def cmd_MEASURE_SPOOL_DIAMETER(self, gcmd):
         if not self.spool_measurement or not hasattr(self, 'vl6180'):
-            gcmd.respond_info("Spool measurement or VL6180 sensor not enabled.")
+            gcmd.error("Spool measurement or VL6180 sensor not enabled.")
             return
         diameter = self.estimate_spool_diameter()
         if diameter is None:
-            gcmd.respond_info("Failed to measure spool diameter - sensor error or no spool detected")
+            gcmd.error("Failed to measure spool diameter - sensor error or no spool detected")
         else:
             gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f} mm")
 
@@ -308,4 +310,4 @@ class SpoolMotionControl:
         gcmd.respond_info(f"  Parameters used: density={density:.2f}g/cm³, width={width:.1f}mm, filament_dia={filament_dia:.2f}mm, packing_eff={packing_eff:.2f}")
 
 def load_config_prefix(config):
-    return SpoolMotionControl(config)
+    return SpoolUnit(config)
