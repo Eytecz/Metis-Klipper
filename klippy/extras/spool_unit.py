@@ -7,11 +7,66 @@
 import math
 import logging
 
+class InsertHelper:
+    def __init__(self, config, spool_unit):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.spool_unit = spool_unit
+
+        # Read config
+        self.insert_load = config.getboolean('load_on_insert', True)
+        insert_pin = config.get('insert_pin', None)
+
+        # Initial state
+        self.min_event_systime = self.reactor.NEVER
+        self.filament_present = False
+        self.sensor_enabled = True
+
+        # Register required objects
+        self.gcode = self.printer.lookup_object('gcode')
+        buttons = self.printer.load_object(config, 'buttons')
+
+        # Register commands and event handlers
+        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        buttons.register_debounce_button(insert_pin, self._event_handler, config)
+
+    def _handle_ready(self):
+        self.min_event_systime = self.reactor.monotonic() + 2.
+    
+    def _event_handler(self, eventtime, state):
+        self.note_filament_present(eventtime, state)
+    
+    def _insert_event_handler(self, eventtime):
+        if self.insert_load:
+            try:
+                self.spool_unit.do_set_position(0.)
+                self.spool_unit.stepper.do_homing_move(movepos=500., speed=25., accel=1000.,
+                                                       triggered=True, check_trigger=True)
+            except Exception as e:
+                logging.error(f"Error during insert event handling: {e}")
+
+    def _runout_event_handler(self, eventtime):
+        pass
+
+    def note_filament_present(self, eventtime, state):
+        if state == self.filament_present:
+            return
+        self.filament_present = state
+
+        if eventtime < self.min_event_systime or not self.sensor_enabled:
+            return
+        
+        if self.filament_present:
+            self._insert_event_handler(eventtime)
+        else:
+            self._runout_event_handler(eventtime)
+
+
+
 class SpoolUnit:
     def __init__(self, config):
         self.config = config
         self.printer = self.config.get_printer()
-        self.reactor = self.printer.get_reactor()
 
         # MCU Tracking
         self.all_mcus = [m for n, m in self.printer.lookup_objects(module='mcu')]
@@ -44,7 +99,10 @@ class SpoolUnit:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
             self.measurement_samples = config.getint('measurement_samples', 10, minval=1, maxval=20)
         self.status_leds = config.get('status_leds', None)
-
+        
+        insert_pin = config.get('insert_pin', None)
+        if insert_pin:
+            self.insert_helper = InsertHelper(config, self)
 
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
@@ -104,7 +162,7 @@ class SpoolUnit:
         self.stepper.trapq_append = self._trapq_append_intercept
         self.wipe_trapq_original = self.stepper.motion_queuing.wipe_trapq
         self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
-   
+        
     def _trapq_append_intercept(self, *args):
         logging.info(f'_trapq_append_intercept with args: {args}')
         self.trapq_append_original(*args)
