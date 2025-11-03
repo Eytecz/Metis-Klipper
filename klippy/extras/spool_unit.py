@@ -66,6 +66,10 @@ class StepperHelper:
         self.reactor = self.printer.get_reactor()
         self.spool_unit = spool_unit
 
+        # Register event handlers
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        
+    def handle_connect(self):
         stepper_name = config.get('stepper', None)
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
             name = manual_stepper[1].get_steppers()[0].get_name()
@@ -79,7 +83,7 @@ class StepperHelper:
         self.stepper.trapq_append = self._trapq_append_intercept
         self.wipe_trapq_original = self.stepper.motion_queuing.wipe_trapq
         self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
-    
+
     def _trapq_append_intercept(self, *args):
         logging.info(f'_trapq_append_intercept with args: {args}')
         self.trapq_append_original(*args)
@@ -88,6 +92,8 @@ class StepperHelper:
     def _wipe_trapq_intercept(self, *args):
         self.wipe_trapq_original(*args)
         self.spool_unit.hbridge_motor.abort_async_motion()
+    
+    
 
 class SpoolUnit:
     def __init__(self, config):
