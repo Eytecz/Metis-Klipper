@@ -37,16 +37,15 @@ class InsertHelper:
         self.note_filament_present(eventtime, state)
     
     def _insert_event_handler(self, eventtime):
+        logging.info(f"Insert event triggered at {eventtime}")
         if self.insert_load:
             try:
-                self.spool_unit.do_set_position(0.)
-                self.spool_unit.stepper.do_homing_move(movepos=500., speed=25., accel=1000.,
-                                                       triggered=True, check_trigger=True)
+                self.gcode.run_script_from_command(f"MANUAL_STEPPER STEPPER={self.spool_unit.name} SET_POSITION=0 MOVE=500 SPEED=25 ACCEL=1000 STOP_ON_ENDSTOP=1")
             except Exception as e:
                 logging.error(f"Error during insert event handling: {e}")
 
     def _runout_event_handler(self, eventtime):
-        pass
+        logging.info(f"Runout event triggered at {eventtime}")
 
     def note_filament_present(self, eventtime, state):
         if state == self.filament_present:
@@ -61,7 +60,34 @@ class InsertHelper:
         else:
             self._runout_event_handler(eventtime)
 
+class StepperHelper:
+    def __init__(self, config, spool_unit):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.spool_unit = spool_unit
 
+        stepper_name = config.get('stepper', None)
+        for manual_stepper in self.printer.lookup_objects('manual_stepper'):
+            name = manual_stepper[1].get_steppers()[0].get_name()
+            if name == stepper_name:
+                self.stepper = manual_stepper[1]
+        if self.stepper is None:
+            raise self.config.error("Could not find stepper '%s'" % self.stepper_name)
+        
+        # Intercept stepper trapq_append and wipe_trapq function to extract motion data
+        self.trapq_append_original = self.stepper.trapq_append
+        self.stepper.trapq_append = self._trapq_append_intercept
+        self.wipe_trapq_original = self.stepper.motion_queuing.wipe_trapq
+        self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
+    
+    def _trapq_append_intercept(self, *args):
+        logging.info(f'_trapq_append_intercept with args: {args}')
+        self.trapq_append_original(*args)
+        self.spool_unit.motion_extraction(*args)
+
+    def _wipe_trapq_intercept(self, *args):
+        self.wipe_trapq_original(*args)
+        self.spool_unit.hbridge_motor.abort_async_motion()
 
 class SpoolUnit:
     def __init__(self, config):
@@ -93,7 +119,7 @@ class SpoolUnit:
         self.poll_interval = config.getfloat('poll_interval', 0.5, minval=0.01)
         self.assist_threshold = config.getfloat('assist_threshold', 20.0, minval=0.0)
         self.hbridge_motor_name = config.get('hbridge_motor', None)
-        self.stepper_name = config.get('stepper', None)
+        
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
@@ -103,6 +129,11 @@ class SpoolUnit:
         insert_pin = config.get('insert_pin', None)
         if insert_pin:
             self.insert_helper = InsertHelper(config, self)
+
+        stepper_name = config.get('stepper', None)
+        if stepper_name:
+            self.stepper = StepperHelper(config, self)
+
 
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
@@ -134,17 +165,7 @@ class SpoolUnit:
             if self.hbridge_motor is None:
                 raise self.config.error("Could not find hbridge_motor '%s'" % self.hbridge_motor_name)
         else:
-            raise self.config.error("Missing required 'hbridge_motor' config option")
-
-        # Connect tracked manual_stepper
-        for manual_stepper in self.printer.lookup_objects('manual_stepper'):
-            name = manual_stepper[1].get_steppers()[0].get_name()
-            if name == self.stepper_name:
-                self.stepper = manual_stepper[1]
-                self.enable_tracking = self.config.getboolean('enable_tracking', True)
-                logging.info(f'stepper {name} connected')
-        if self.stepper is None:
-            raise self.config.error("Could not find stepper '%s'" % self.stepper_name)  
+            raise self.config.error("Missing required 'hbridge_motor' config option") 
 
         # Connect vl6180 sensor
         if self.vl6180_name:
@@ -157,22 +178,9 @@ class SpoolUnit:
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
             self.toolhead = self.printer.lookup_object('toolhead')
 
-        # Intercept stepper trapq_append and wipe_trapq function to extract motion data
-        self.trapq_append_original = self.stepper.trapq_append
-        self.stepper.trapq_append = self._trapq_append_intercept
-        self.wipe_trapq_original = self.stepper.motion_queuing.wipe_trapq
-        self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
-        
-    def _trapq_append_intercept(self, *args):
-        logging.info(f'_trapq_append_intercept with args: {args}')
-        self.trapq_append_original(*args)
-        self._motion_extraction(*args)
-
-    def _wipe_trapq_intercept(self, *args):
-        self.wipe_trapq_original(*args)
-        self.hbridge_motor.abort_async_motion()
-
-    def _motion_extraction(self, *args):
+               
+    
+    def motion_extraction(self, *args):
         print_time = args[1]
         runtime = args[2] + args[3] + args[4]
         move_distance = (1/2 * args[13] * (args[2]**2) + args[12] * args[3] + 1/2 * args[13] * (args[4]**2))* args[8]
