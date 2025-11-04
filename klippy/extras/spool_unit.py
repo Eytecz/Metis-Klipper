@@ -21,6 +21,7 @@ class InsertHelper:
         self.min_event_systime = self.reactor.NEVER
         self.filament_present = False
         self.sensor_enabled = True
+        self.homing_state = False
 
         # Register required objects
         self.gcode = self.printer.lookup_object('gcode')
@@ -32,29 +33,33 @@ class InsertHelper:
 
     def _handle_ready(self):
         self.min_event_systime = self.reactor.monotonic() + 2.
-    
+
     def _event_handler(self, eventtime, state):
         self.note_filament_present(eventtime, state)
-    
+
     def _insert_event_handler(self, eventtime):
-        logging.info(f"Insert event triggered at {eventtime}")
-        if self.insert_load:
+        if self.insert_load and not self.homing_state:
             try:
-                self.gcode.run_script_from_command(f"MANUAL_STEPPER STEPPER={self.spool_unit.name} SET_POSITION=0 MOVE=500 SPEED=25 ACCEL=1000 STOP_ON_ENDSTOP=1")
+                self.homing_state = True
+                self.spool_unit.stepper_helper.stepper.do_set_position(0.)
+                self.spool_unit.stepper_helper.stepper.do_homing_move(movepos=500, speed=25, accel=1000, triggered=True, check_trigger=True)
+                self.spool_unit.stepper_helper.stepper.do_set_position(0.)
+                self.homing_state = False
             except Exception as e:
+                self.homing_state = False
                 logging.error(f"Error during insert event handling: {e}")
 
     def _runout_event_handler(self, eventtime):
         logging.info(f"Runout event triggered at {eventtime}")
 
     def note_filament_present(self, eventtime, state):
+        if eventtime < self.min_event_systime or not self.sensor_enabled:
+            logging.debug(f"Ignored insert/runout event due to debounce/startup guard: eventtime={eventtime}, min_event_systime={self.min_event_systime}")
+            return
         if state == self.filament_present:
             return
         self.filament_present = state
-
-        if eventtime < self.min_event_systime or not self.sensor_enabled:
-            return
-        
+        self.min_event_systime = eventtime + 2.
         if self.filament_present:
             self._insert_event_handler(eventtime)
         else:
@@ -62,21 +67,23 @@ class InsertHelper:
 
 class StepperHelper:
     def __init__(self, config, spool_unit):
+        self.config = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.spool_unit = spool_unit
+        self.stepper = None
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         
     def handle_connect(self):
-        stepper_name = config.get('stepper', None)
+        stepper_name = self.config.get('stepper', None)
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
             name = manual_stepper[1].get_steppers()[0].get_name()
             if name == stepper_name:
                 self.stepper = manual_stepper[1]
         if self.stepper is None:
-            raise self.config.error("Could not find stepper '%s'" % self.stepper_name)
+            raise self.config.error("Could not find stepper '%s'" % stepper_name)
         
         # Intercept stepper trapq_append and wipe_trapq function to extract motion data
         self.trapq_append_original = self.stepper.trapq_append
@@ -92,6 +99,21 @@ class StepperHelper:
     def _wipe_trapq_intercept(self, *args):
         self.wipe_trapq_original(*args)
         self.spool_unit.hbridge_motor.abort_async_motion()
+    
+    def query_endstop(self, print_time=None):
+        if print_time is None:
+            print_time = self.printer.lookup_object('toolhead').get_last_move_time()
+        qe = self.printer.lookup_object('query_endstops')
+        for mcu_endstop, name in qe.endstops:
+            if name == self.stepper.get_steppers()[0].get_name():
+                state = mcu_endstop.query_endstop(print_time)
+                logging.info(f'Query endstop for stepper {name} at time {print_time}: {state}')
+                break
+            state = None
+        if state is None:
+            logging.warning(f'No endstop found for stepper {self.stepper.get_steppers()[0].get_name()}')
+            return None
+        return bool(state)
     
     
 
@@ -138,7 +160,7 @@ class SpoolUnit:
 
         stepper_name = config.get('stepper', None)
         if stepper_name:
-            self.stepper = StepperHelper(config, self)
+            self.stepper_helper = StepperHelper(config, self)
 
 
         # Material and spool properties for content estimation
@@ -157,6 +179,10 @@ class SpoolUnit:
         self.gcode.register_mux_command('ESTIMATE_SPOOL_CONTENT', 'SPOOL', self.name,
                                         self.cmd_ESTIMATE_SPOOL_CONTENT,
                                         desc="Estimate the remaining filament content on the spool.")
+        self.gcode.register_mux_command('QUERY_STEPPER_ENDSTOP', 'SPOOL', self.name,
+                                        self.cmd_QUERY_STEPPER_ENDSTOP,
+                                        desc="Query the endstop state of the specified stepper.")
+        
 
     def handle_ready(self):
         pass
@@ -184,7 +210,13 @@ class SpoolUnit:
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
             self.toolhead = self.printer.lookup_object('toolhead')
 
-               
+    def cmd_QUERY_STEPPER_ENDSTOP(self, gcmd):
+        state = self.stepper_helper.query_endstop()
+        if state is None:
+            gcmd.error(f"Could not query endstop for stepper")
+        else:
+            gcmd.respond_info(f"Endstop state for stepper: {'triggered' if state else 'open'}")
+
     
     def motion_extraction(self, *args):
         print_time = args[1]
