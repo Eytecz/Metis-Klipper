@@ -1,6 +1,6 @@
 # Collection of spool unit related functions
 #
-# Copyright (C) 2025 Eytecz
+# Copyright (C) 2025 Eytecz Engineering
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
 
@@ -29,6 +29,7 @@ class InsertHelper:
         # Read config
         self.insert_load = config.getboolean('load_on_insert', True)
         insert_pin = config.get('insert_pin', None)
+        self.debounce_time = config.getfloat('debounce_time', 0.5)
 
         # Initial state
         self.min_event_systime = self.reactor.NEVER
@@ -45,7 +46,7 @@ class InsertHelper:
         buttons.register_debounce_button(insert_pin, self._event_handler, config)
 
     def handle_ready(self):
-        self.min_event_systime = self.reactor.monotonic() + 2.
+        self.min_event_systime = self.reactor.monotonic() + self.debounce_time
 
     def _event_handler(self, eventtime, state):
         self.note_filament_present(eventtime, state)
@@ -70,12 +71,11 @@ class InsertHelper:
 
     def note_filament_present(self, eventtime, state):
         if eventtime < self.min_event_systime or not self.sensor_enabled:
-            logging.debug(f"Ignored insert/runout event due to debounce/startup guard: eventtime={eventtime}, min_event_systime={self.min_event_systime}")
             return
         if state == self.filament_present:
             return
         self.filament_present = state
-        self.min_event_systime = eventtime + 2.
+        self.min_event_systime = eventtime + self.debounce_time
         if self.filament_present:
             self._insert_event_handler(eventtime)
         else:
@@ -253,7 +253,8 @@ class SpoolUnit:
         self.poll_interval = config.getfloat('poll_interval', 0.5, minval=0.01)
         self.assist_threshold = config.getfloat('assist_threshold', 20.0, minval=0.0)
         self.hbridge_motor_name = config.get('hbridge_motor', None)
-        
+        self.filament_hub_name = config.get('filament_hub', None):
+
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
@@ -270,7 +271,7 @@ class SpoolUnit:
         stepper_name = config.get('stepper', None)
         if stepper_name:
             self.stepper_helper = StepperHelper(config, self)
-
+        
 
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
@@ -299,6 +300,15 @@ class SpoolUnit:
         self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2)
 
     def handle_connect(self):
+        # Connect filament hub modules
+        if self.filament_hub_name:
+            for filament_hub in self.printer.lookup_objects('filament_hub'):
+                name = filament_hub[1].get_name()
+                if name == self.filament_hub_name:
+                    self.filament_hub = filament_hub[1]
+            if self.filament_hub is None:
+                raise self.config.error("Could not find filament_hub '%s'" % self.filament_hub_name)
+
         # Connect hbridge_motor modules 
         if self.hbridge_motor_name:
             for hbridge_motor in self.printer.lookup_objects('hbridge_motor'):
