@@ -6,6 +6,19 @@
 
 import math
 import logging
+import configparser
+from configfile import ConfigWrapper
+from .led_effect import ledEffect
+
+STATUS_INITIALIZING     = 'initializing'    # State detection to find initial state
+STATUS_EMPTY            = 'empty'           # No filament present in the pre-gate sensor
+STATUS_HOMING           = 'homing'          # Automated loading assist of filament until post-gear sensor
+STATUS_IDLE             = 'idle'            # Filament available in spool unit extruder gear
+STATUS_LOADING          = 'loading'         # Automated loading as effect of request event until toolhead
+STATUS_LOADED           = 'loaded'          # Filament available in toolhead and ready for printing
+STATUS_UNLOADING        = 'unloading'       # Automated unloading as effect of exchange/remove request event
+STATUS_RUNOUT           = 'runout'          # Filament runout detected during printing on pre-gate sensor
+STATUS_ERROR            = 'error'           # Exception occurred during homing/loading/unloading/
 
 class InsertHelper:
     def __init__(self, config, spool_unit):
@@ -28,10 +41,10 @@ class InsertHelper:
         buttons = self.printer.load_object(config, 'buttons')
 
         # Register commands and event handlers
-        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
         buttons.register_debounce_button(insert_pin, self._event_handler, config)
 
-    def _handle_ready(self):
+    def handle_ready(self):
         self.min_event_systime = self.reactor.monotonic() + 2.
 
     def _event_handler(self, eventtime, state):
@@ -51,6 +64,9 @@ class InsertHelper:
 
     def _runout_event_handler(self, eventtime):
         logging.info(f"Runout event triggered at {eventtime}")
+    
+    def query_endstop(self):
+        return self.filament_present
 
     def note_filament_present(self, eventtime, state):
         if eventtime < self.min_event_systime or not self.sensor_enabled:
@@ -115,18 +131,108 @@ class StepperHelper:
             return None
         return bool(state)
     
-    
+class LEDHelper:
+    def __init__(self, config, spool_unit):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.name = spool_unit.get_name()
 
+        # Initial state
+        self.state_effects = {}
+
+        # State layer default presets
+        LAYER_INITIALIZING = """breathing     2  1     top        (0.0, 0.0, 0.0, 1.0)"""
+        LAYER_EMPTY        = """static        0  0     top        (0.0, 0.0, 0.0, 1.0)"""
+        LAYER_HOMING       = """breathing     2  1     top        (0.0, 0.0, 1.0, 0.0)"""
+        LAYER_IDLE         = """static        0  0     top        (0.0, 0.0, 1.0, 0.0)"""
+        LAYER_LOADING      = """breathing     2  1     top        (0.0, 1.0, 0.0, 0.0)"""
+        LAYER_LOADED       = """static        0  0     top        (0.0, 1.0, 0.0, 0.0)"""
+        LAYER_UNLOADING    = """breathing     2  1     top        (1.0, 0.0, 0.0, 0.0)"""
+        LAYER_RUNOUT       = """breathing     2  1     top        (1.0, 0.5, 0.0, 0.0)"""
+        LAYER_ERROR        = """strobe        1  1.5   add        (1.0, 1.0, 1.0, 1.0)
+                                breathing     2  0     difference (1.0, 0.0, 0.0, 0.0)
+                                static        1  0     top        (1.0, 0.0, 0.0, 0.0)"""
+        
+        # Read config section
+        self.state_layers = {
+            STATUS_INITIALIZING:    config.get('state_layer_initializing', LAYER_INITIALIZING),
+            STATUS_EMPTY:           config.get('state_layer_empty', LAYER_EMPTY),
+            STATUS_HOMING:          config.get('state_layer_homing', LAYER_HOMING),
+            STATUS_IDLE:            config.get('state_layer_idle', LAYER_IDLE),
+            STATUS_LOADING:         config.get('state_layer_loading', LAYER_LOADING),
+            STATUS_LOADED:          config.get('state_layer_loaded', LAYER_LOADED),
+            STATUS_UNLOADING:       config.get('state_layer_unloading', LAYER_UNLOADING),
+            STATUS_RUNOUT:          config.get('state_layer_runout', LAYER_RUNOUT),
+            STATUS_ERROR:           config.get('state_layer_error', LAYER_ERROR)
+            }
+        self.frame_rate = config.getfloat('frame_rate', default=24, minval=1, maxval=60)
+        self.status_leds = config.get('status_leds')
+        
+        # Lookup required objects
+        self.configfile = self.printer.lookup_object('configfile')
+
+        # Register event handlers
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+    
+    def handle_connect(self):
+        self._create_led_configs()   
+    
+    def _create_led_configs(self):
+        configs = {}
+        for state, state_layer in self.state_layers.items():
+            effect_name = f'{self.name}_{state}'
+            effect_config = {
+                'auto_start':   'False',
+                'frame_rate':   str(self.frame_rate),
+                'layers':       state_layer,
+                'leds':         self.status_leds
+            }
+            config, section = self._create_led_config(effect_name, effect_config)
+            configs[state] = config
+
+            try:
+                self.printer.add_object(section, self.printer.load_object(config, 'led_effect'))
+                self.state_effects[state] = ledEffect(config)
+            except Exception as e:
+                logging.error(f"Error creating LED effect '{effect_name}': {e}")
+                   
+    def _create_led_config(self, effect_name, effect_config):
+        # Create a new configparser with the led effect configuration
+        fileconfig = configparser.RawConfigParser()
+        section_name = f"led_effect {effect_name}"
+        fileconfig.add_section(section_name)
+        
+        # Add configuration options
+        for key, value in effect_config.items():
+            fileconfig.set(section_name, key, str(value))
+        
+        # Create ConfigWrapper
+        config_wrapper = ConfigWrapper(self.printer, fileconfig, self.configfile.validate.access_tracking, section_name)
+        return config_wrapper, section_name
+
+    def set_state(self, state):
+        if state not in self.state_effects:
+            logging.warning(f"LED effect for state '{state}' not found")
+            return
+        led_effect = self.state_effects[state]
+        for led in led_effect.leds:
+            for effect in led_effect.handler.effects:
+                if effect is not led_effect and led in effect.leds:
+                    effect.set_enabled(False)
+        led_effect.set_enabled(True)
+         
 class SpoolUnit:
     def __init__(self, config):
         self.config = config
         self.printer = self.config.get_printer()
+        self.reactor = self.printer.get_reactor()
 
         # MCU Tracking
         self.all_mcus = [m for n, m in self.printer.lookup_objects(module='mcu')]
         self.mcu = self.all_mcus[0]
 
         # Initial state
+        self.state = None
         self.spool_measurement = False
         self.assist_forward = False
         self.assist_reverse = True
@@ -152,8 +258,11 @@ class SpoolUnit:
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
             self.measurement_samples = config.getint('measurement_samples', 10, minval=1, maxval=20)
-        self.status_leds = config.get('status_leds', None)
         
+        status_leds = config.get('status_leds', None)
+        if status_leds:
+            self.led_helper = LEDHelper(config, self)
+
         insert_pin = config.get('insert_pin', None)
         if insert_pin:
             self.insert_helper = InsertHelper(config, self)
@@ -182,10 +291,12 @@ class SpoolUnit:
         self.gcode.register_mux_command('QUERY_STEPPER_ENDSTOP', 'SPOOL', self.name,
                                         self.cmd_QUERY_STEPPER_ENDSTOP,
                                         desc="Query the endstop state of the specified stepper.")
-        
+        self.gcode.register_mux_command('SET_STATUS', 'SPOOL', self.name,
+                                        self.cmd_SET_STATUS,
+                                        desc="Set the status of the spool unit for LED indication.")
 
     def handle_ready(self):
-        pass
+        self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2)
 
     def handle_connect(self):
         # Connect hbridge_motor modules 
@@ -209,6 +320,9 @@ class SpoolUnit:
                 raise self.config.error("Could not find vl6180 '%s'" % self.vl6180_name)
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
             self.toolhead = self.printer.lookup_object('toolhead')
+        
+    def cmd_SET_STATUS(self, gcmd):
+        self.led_helper.set_state(gcmd.get('STATUS'))
 
     def cmd_QUERY_STEPPER_ENDSTOP(self, gcmd):
         state = self.stepper_helper.query_endstop()
@@ -217,6 +331,9 @@ class SpoolUnit:
         else:
             gcmd.respond_info(f"Endstop state for stepper: {'triggered' if state else 'open'}")
 
+    def initialize_spool_unit(self, eventtime):
+        self.led_helper.set_state(STATUS_INITIALIZING)
+        return self.reactor.NEVER
     
     def motion_extraction(self, *args):
         print_time = args[1]
