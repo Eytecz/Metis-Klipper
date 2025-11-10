@@ -6,10 +6,12 @@
 
 import math
 import logging
+import traceback
 import configparser
 from configfile import ConfigWrapper
 from .led_effect import ledEffect
 
+STATUS_UNINITIALIZED    = 'uninitialized'   # Initial state before determining actual status
 STATUS_INITIALIZING     = 'initializing'    # State detection to find initial state
 STATUS_EMPTY            = 'empty'           # No filament present in the pre-gate sensor
 STATUS_HOMING           = 'homing'          # Automated loading assist of filament until post-gear sensor
@@ -18,7 +20,8 @@ STATUS_LOADING          = 'loading'         # Automated loading as effect of req
 STATUS_LOADED           = 'loaded'          # Filament available in toolhead and ready for printing
 STATUS_UNLOADING        = 'unloading'       # Automated unloading as effect of exchange/remove request event
 STATUS_RUNOUT           = 'runout'          # Filament runout detected during printing on pre-gate sensor
-STATUS_ERROR            = 'error'           # Exception occurred during homing/loading/unloading/
+STATUS_ERROR            = 'error'           # Exception occurred during homing/loading/unloading
+STATUS_CALIBRATING      = 'calibrating'     # Automated calibration processes ongoing
 
 class InsertHelper:
     def __init__(self, config, spool_unit):
@@ -29,7 +32,7 @@ class InsertHelper:
         # Read config
         self.insert_load = config.getboolean('load_on_insert', True)
         insert_pin = config.get('insert_pin', None)
-        self.debounce_time = config.getfloat('debounce_time', 0.5)
+        self.debounce_time = config.getfloat('debounce_time', 2.0)
 
         # Initial state
         self.min_event_systime = self.reactor.NEVER
@@ -54,27 +57,30 @@ class InsertHelper:
     def _insert_event_handler(self, eventtime):
         if self.insert_load and not self.homing_state:
             try:
+                self.spool_unit.set_status(STATUS_HOMING)
                 self.homing_state = True
-                self.spool_unit.stepper_helper.stepper.do_set_position(0.)
-                self.spool_unit.stepper_helper.stepper.do_homing_move(movepos=500, speed=25, accel=1000, triggered=True, check_trigger=True)
-                self.spool_unit.stepper_helper.stepper.do_set_position(0.)
+                self.spool_unit.stepper_helper.do_homing_move(movepos=500.0, triggered=True)
+                self.spool_unit.stepper_helper.do_move(movepos=-10.0)
                 self.homing_state = False
+                self.spool_unit.set_status(STATUS_IDLE)
             except Exception as e:
+                self.spool_unit.set_status(STATUS_ERROR)
                 self.homing_state = False
                 logging.error(f"Error during insert event handling: {e}")
 
     def _runout_event_handler(self, eventtime):
+        self.spool_unit.set_status(STATUS_EMPTY)
         logging.info(f"Runout event triggered at {eventtime}")
     
     def query_endstop(self):
         return self.filament_present
 
     def note_filament_present(self, eventtime, state):
-        if eventtime < self.min_event_systime or not self.sensor_enabled:
-            return
         if state == self.filament_present:
             return
         self.filament_present = state
+        if eventtime < self.min_event_systime or not self.sensor_enabled:
+            return
         self.min_event_systime = eventtime + self.debounce_time
         if self.filament_present:
             self._insert_event_handler(eventtime)
@@ -92,6 +98,12 @@ class StepperHelper:
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         
+        # Optional config sections
+        self.load_speed = config.getfloat('load_speed', 50.0, minval=1.0)
+        self.unload_speed = config.getfloat('unload_speed', 50.0, minval=1.0)
+        self.homing_speed = config.getfloat('homing_speed', 25.0, minval=1.0)
+        self.accel = config.getfloat('accel', 1000.0, minval=1.0)
+
     def handle_connect(self):
         stepper_name = self.config.get('stepper', None)
         for manual_stepper in self.printer.lookup_objects('manual_stepper'):
@@ -108,7 +120,6 @@ class StepperHelper:
         self.stepper.motion_queuing.wipe_trapq = self._wipe_trapq_intercept
 
     def _trapq_append_intercept(self, *args):
-        logging.info(f'_trapq_append_intercept with args: {args}')
         self.trapq_append_original(*args)
         self.spool_unit.motion_extraction(*args)
 
@@ -123,13 +134,27 @@ class StepperHelper:
         for mcu_endstop, name in qe.endstops:
             if name == self.stepper.get_steppers()[0].get_name():
                 state = mcu_endstop.query_endstop(print_time)
-                logging.info(f'Query endstop for stepper {name} at time {print_time}: {state}')
                 break
             state = None
         if state is None:
             logging.warning(f'No endstop found for stepper {self.stepper.get_steppers()[0].get_name()}')
             return None
         return bool(state)
+
+    def do_homing_move(self, movepos, triggered):
+        self.stepper.do_set_position(0.)
+        self.stepper.do_homing_move(movepos, self.homing_speed, self.accel, triggered, check_trigger=True)
+        self.stepper.do_set_position(0.)
+    
+    def do_move(self, movepos):
+        if movepos >=0:
+            speed = self.load_speed
+        else:
+            speed = self.unload_speed
+        self.stepper.do_move(movepos, speed, self.accel, sync=True)
+    
+    def do_set_position(self, position):
+        self.stepper.do_set_position(position)
     
 class LEDHelper:
     def __init__(self, config, spool_unit):
@@ -152,6 +177,7 @@ class LEDHelper:
         LAYER_ERROR        = """strobe        1  1.5   add        (1.0, 1.0, 1.0, 1.0)
                                 breathing     2  0     difference (1.0, 0.0, 0.0, 0.0)
                                 static        1  0     top        (1.0, 0.0, 0.0, 0.0)"""
+        LAYER_CALIBRATING  = """breathing     2  1     top        (1.0, 1.0, 0.0, 0.0)"""
         
         # Read config section
         self.state_layers = {
@@ -163,7 +189,8 @@ class LEDHelper:
             STATUS_LOADED:          config.get('state_layer_loaded', LAYER_LOADED),
             STATUS_UNLOADING:       config.get('state_layer_unloading', LAYER_UNLOADING),
             STATUS_RUNOUT:          config.get('state_layer_runout', LAYER_RUNOUT),
-            STATUS_ERROR:           config.get('state_layer_error', LAYER_ERROR)
+            STATUS_ERROR:           config.get('state_layer_error', LAYER_ERROR),
+            STATUS_CALIBRATING:     config.get('state_layer_calibrating', LAYER_CALIBRATING)
             }
         self.frame_rate = config.getfloat('frame_rate', default=24, minval=1, maxval=60)
         self.status_leds = config.get('status_leds')
@@ -232,12 +259,15 @@ class SpoolUnit:
         self.mcu = self.all_mcus[0]
 
         # Initial state
-        self.state = None
+        self.status = STATUS_UNINITIALIZED
+        self.sensor_states = {}
         self.spool_measurement = False
         self.assist_forward = False
         self.assist_reverse = True
         self.enable_tracking = True
         self.moved_distance = 0.
+        self.can_extrude_original = None
+        self.synced = False
 
         # Register handlers
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -253,8 +283,10 @@ class SpoolUnit:
         self.poll_interval = config.getfloat('poll_interval', 0.5, minval=0.01)
         self.assist_threshold = config.getfloat('assist_threshold', 20.0, minval=0.0)
         self.hbridge_motor_name = config.get('hbridge_motor', None)
-        self.filament_hub_name = config.get('filament_hub', None):
-
+        self.filament_hub_name = config.get('filament_hub', None)
+        self.toolhead_sensor_name = config.get('toolhead_sensor', None)
+        self.extruder_name = config.get('extruder', 'extruder')
+        
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
@@ -268,10 +300,9 @@ class SpoolUnit:
         if insert_pin:
             self.insert_helper = InsertHelper(config, self)
 
-        stepper_name = config.get('stepper', None)
-        if stepper_name:
-            self.stepper_helper = StepperHelper(config, self)
-        
+        self.stepper_name = config.get('stepper', None)
+        if self.stepper_name:
+            self.stepper_helper = StepperHelper(config, self)  
 
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
@@ -289,17 +320,27 @@ class SpoolUnit:
         self.gcode.register_mux_command('ESTIMATE_SPOOL_CONTENT', 'SPOOL', self.name,
                                         self.cmd_ESTIMATE_SPOOL_CONTENT,
                                         desc="Estimate the remaining filament content on the spool.")
-        self.gcode.register_mux_command('QUERY_STEPPER_ENDSTOP', 'SPOOL', self.name,
-                                        self.cmd_QUERY_STEPPER_ENDSTOP,
-                                        desc="Query the endstop state of the specified stepper.")
         self.gcode.register_mux_command('SET_STATUS', 'SPOOL', self.name,
                                         self.cmd_SET_STATUS,
                                         desc="Set the status of the spool unit for LED indication.")
+        self.gcode.register_mux_command('LOAD_SPOOL', 'SPOOL', self.name,
+                                        self.cmd_LOAD_SPOOL,
+                                        desc="Load filament from spool unit to toolhead.")
+        self.gcode.register_mux_command('CALIBRATE_BOWDEN_LENGTH', 'SPOOL', self.name,
+                                        self.cmd_CALIBRATE_BOWDEN_LENGTH,
+                                        desc="Calibrate the bowden length from spool unit to toolhead.")
+
 
     def handle_ready(self):
-        self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2)
+        self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2.0)
 
     def handle_connect(self):
+        self.axis_sync = self.printer.lookup_object('axis_sync')
+        self.toolhead = self.printer.lookup_object('toolhead')
+
+        # Connect extruder
+        self.extruder = self.printer.lookup_object(self.extruder_name)
+
         # Connect filament hub modules
         if self.filament_hub_name:
             for filament_hub in self.printer.lookup_objects('filament_hub'):
@@ -308,6 +349,16 @@ class SpoolUnit:
                     self.filament_hub = filament_hub[1]
             if self.filament_hub is None:
                 raise self.config.error("Could not find filament_hub '%s'" % self.filament_hub_name)
+        
+        # Connect toolhead sensor modules
+        if self.toolhead_sensor_name:
+            self.toolhead_sensor = None
+            for toolhead_sensor in self.printer.lookup_objects('filament_switch_sensor'):
+                name = toolhead_sensor[1].runout_helper.name
+                if name == self.toolhead_sensor_name:
+                    self.toolhead_sensor = toolhead_sensor[1]
+            if self.toolhead_sensor is None:
+                raise self.config.error("Could not find toolhead_sensor '%s'" % self.toolhead_sensor_name)
 
         # Connect hbridge_motor modules 
         if self.hbridge_motor_name:
@@ -329,57 +380,242 @@ class SpoolUnit:
             if self.vl6180 is None:
                 raise self.config.error("Could not find vl6180 '%s'" % self.vl6180_name)
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
-            self.toolhead = self.printer.lookup_object('toolhead')
-        
-    def cmd_SET_STATUS(self, gcmd):
-        self.led_helper.set_state(gcmd.get('STATUS'))
-
-    def cmd_QUERY_STEPPER_ENDSTOP(self, gcmd):
-        state = self.stepper_helper.query_endstop()
-        if state is None:
-            gcmd.error(f"Could not query endstop for stepper")
-        else:
-            gcmd.respond_info(f"Endstop state for stepper: {'triggered' if state else 'open'}")
-
-    def initialize_spool_unit(self, eventtime):
-        self.led_helper.set_state(STATUS_INITIALIZING)
-        return self.reactor.NEVER
     
+           
+    def cmd_SET_STATUS(self, gcmd):
+        self.set_status(gcmd.get('STATUS'))
+
+    def cmd_LOAD_SPOOL(self, gcmd):
+        self.spool_load()
+
+    def set_status(self, status):
+        if self.status == status:
+            return
+        self.status = status
+        if self.led_helper:
+            self.led_helper.set_state(self.status)
+        
+    def initialize_spool_unit(self, eventtime):
+        self.set_status(STATUS_INITIALIZING)
+        self.sensor_states = {
+            'pre_gate_sensor': bool(self.insert_helper.query_endstop()) if hasattr(self, 'insert_helper') else None,
+            'post_gear_sensor': bool(self.stepper_helper.query_endstop()) if hasattr(self, 'stepper_helper') else None,
+            'hub_sensor': bool(self.filament_hub.query_hub_endstop()) if hasattr(self, 'filament_hub') else None,
+            'toolhead_sensor': bool(self.toolhead_sensor.runout_helper.filament_present) if hasattr(self, 'toolhead_sensor') else None
+        }
+        if self.sensor_states.get('pre_gate_sensor') == False:
+            if self.sensor_states.get('post_gear_sensor') == False:
+                self.set_status(STATUS_EMPTY)
+            else:
+                self.set_status(STATUS_ERROR)
+        elif self.sensor_states.get('pre_gate_sensor') == True:
+            if self.sensor_states.get('post_gear_sensor') == False:
+                try:
+                    self.stepper_helper.do_homing_move(movepos=50.0, triggered=True)
+                    self.stepper_helper.do_move(movepos=-10.0)
+                    self.stepper_helper.do_set_position(0.)
+                    self.set_status(STATUS_IDLE)
+                except Exception as e:
+                    self.set_status(STATUS_EMPTY)
+                    logging.error(f"Error during homing move: {e}") 
+            else:
+                if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == True:
+                    self.filament_hub.set_loaded_spool_unit(self)
+                    self.set_status(STATUS_LOADED)
+                else:
+                    self.set_status(STATUS_ERROR)
+        logging.info(f'Spool unit {self.name} status determined as: {self.status}')
+        return self.reactor.NEVER        
+
+    def spool_load(self):
+        if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
+            # Check shared hub sensor state and unload if required
+            loaded_spool = self.filament_hub.get_loaded_spool_unit()
+            if loaded_spool is self:
+                return
+            elif loaded_spool is not None:
+                loaded_spool.spool_unload()
+            # Load filament to toolhead
+            try:
+                self.set_status(STATUS_LOADING)
+                self.stepper_helper.do_move('some distance...') # Course move
+                # Program iterative move here later
+                # Sync to toolhead
+                self.set_status(STATUS_LOADED)
+            except Exception as e:
+                self.set_status(STATUS_ERROR)
+                logging.error(f"Error during spool load: {e}")
+                return
+    
+    def cmd_CALIBRATE_BOWDEN_LENGTH(self, gcmd):
+        self.calibrate_bowden_length()
+
+    def calibrate_bowden_length(self):
+        if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
+            # Check shared hub sensor state and unload
+            loaded_spool = self.filament_hub.get_loaded_spool_unit()
+            if loaded_spool is self:
+                self.spool_unload()
+            elif loaded_spool is not None:
+                loaded_spool.spool_unload()
+            self.set_status(STATUS_CALIBRATING)
+            try:
+                # Reposition filament at correct distance from post-gear sensor
+                self.stepper_helper.do_homing_move(movepos=50.0, triggered=True)
+                self.stepper_helper.do_move(movepos=-10.0)
+                self.stepper_helper.do_set_position(0.)
+                
+                # Estimate filament hub sensor distance
+                step_size = 1.0
+                movepos = step_size 
+                while not self.filament_hub.query_hub_endstop():
+                    self.stepper_helper.do_move(movepos)
+                    self.toolhead.wait_moves()
+                    movepos += step_size
+                hub_distance = self.stepper_helper.stepper.get_position()[0]
+                logging.info(f"Calibrated filament hub sensor distance: {hub_distance} mm")
+
+                # Estimate toolhead sensor distance
+                self.sync_to_extruder(True)
+                speed = self.stepper_helper.homing_speed
+                step_size = 10.0    # Coarse step size due to large distance
+                pos = self.toolhead.get_position()
+                init_pos = pos[3]
+                pos[3] += step_size
+                while not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    self.toolhead.move(pos, speed)
+                    self.toolhead.wait_moves()
+                    pos[3] += step_size
+                # Back off and do fine steps
+                pos[3] -= 2 * step_size 
+                self.toolhead.move(pos, speed)
+                self.toolhead.wait_moves()
+                step_size = 1.0    # Fine step size for accurate measurement
+                pos[3] += step_size
+                while not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    self.toolhead.move(pos, speed)
+                    self.toolhead.wait_moves()
+                    pos[3] += step_size
+                hub_toolhead_distance = pos[3] - init_pos - step_size
+                self.sync_to_extruder(False)
+                
+                # Estimate buffer length and calculate min/max positions for toolhead sensor
+                advance_state = bool(self.filament_hub.query_advancing_endstop())
+                trailing_state = bool(self.filament_hub.query_trailing_endstop())
+                step_size = 1.0
+                movepos = self.stepper_helper.stepper.get_position()[0]
+                init_pos = movepos
+                if advance_state and trailing_state:        # Invalid state
+                    raise Exception("Both buffer endstops are triggered! Cannot calibrate buffer length.")
+                elif advance_state and not trailing_state:  # Fully extended state
+                    movepos -= step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos += 2 * step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    correction_length = advancing_trigger_pos - init_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_max = hub_toolhead_distance + correction_length
+                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
+                elif not advance_state and trailing_state:  # Fully retracted state
+                    movepos += step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos -= 2 * step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    correction_length = trailing_trigger_pos - init_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_min = hub_toolhead_distance + correction_length
+                    hub_toolhead_distance_max = hub_toolhead_distance_min + buffer_length
+                else:                                       # Somewhere in between  
+                    movepos -= step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos += 2 * step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_max = hub_toolhead_distance + (advancing_trigger_pos - init_pos)
+                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
+                logging.info(f"Calibrated filament hub to toolhead distance range: {hub_toolhead_distance_min} mm - {hub_toolhead_distance_max} mm")
+
+                # Move to mean position
+                self.stepper_helper.do_move(mean_pos)                
+                
+                self.set_status(STATUS_IDLE)
+
+            except Exception as e:
+                self.set_status(STATUS_ERROR)
+                logging.error(f"Error during calibration: {e}")
+                return
+        else:
+            logging.error("Calibration cannot be performed unless spool is in IDLE or LOADED state")
+            return
+
+    def sync_to_extruder(self, state):
+        if self.synced == state:
+            return
+        try:
+            if state:
+                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, self.extruder_name)
+            else:
+                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, None)
+            self.synced = state
+        except Exception as e:
+            logging.error(f"Error during extruder sync: {e}")
+            logging.error(traceback.format_exc())
+            return   
+
+    def spool_unload(self):
+        pass
+
     def motion_extraction(self, *args):
         print_time = args[1]
         runtime = args[2] + args[3] + args[4]
         move_distance = (1/2 * args[13] * (args[2]**2) + args[12] * args[3] + 1/2 * args[13] * (args[4]**2))* args[8]
         cruise_v = args[12]
         move_dir = args[8]
-        logging.info(f'_motion_extraction: print_time={print_time}, runtime={runtime}, move_distance={move_distance}, cruise_v={cruise_v}, move_dir={move_dir}')
 
         if self.enable_tracking:
-            logging.info('tracking is True, proceeding with move motion_planning')
             if abs(move_distance) >= self.assist_threshold:
-                logging.info(f'move_distance={move_distance} >= self.assist_threshold={self.assist_threshold}')
                 self.moved_distance = 0.
                 self._motion_planning(cruise_v, move_dir, print_time, runtime)
             else:
-                logging.info(f'self.moved_distance={self.moved_distance} += {move_distance}')
                 self.moved_distance += move_distance
-                logging.info(f'self.moved_distance={self.moved_distance}')
                 if abs(self.moved_distance) >= self.assist_threshold:
-                    logging.info(f'move_distance={move_distance} >= self.assist_threshold={self.assist_threshold}')
                     self._assist_threshold_motion_planning(self.moved_distance)
                     self.moved_distance = 0.
 
     def _motion_planning(self, cruise_v, move_dir, print_time, runtime):
-        logging.info(f'_motion_planning cruise_v={cruise_v}, move_dir={move_dir}, print_time={print_time}, runtime={runtime}')
         if move_dir == 1:
-            logging.info(f'self.assist_forward={self.assist_forward}')
             if self.assist_forward:
-                logging.info('_motion_planning assist_forward')
                 pwm_value = move_dir * self._get_scaling_factor(cruise_v)
                 self.hbridge_motor.scheduled_async_motion(pwm_value, print_time, runtime)
         else:
-            logging.info(f'self.assist_reverse={self.assist_reverse}')
             if self.assist_reverse:
-                logging.info('_motion_planning assist_reverse')
                 pwm_value = move_dir * self._get_scaling_factor(cruise_v)
                 self.hbridge_motor.scheduled_async_motion(pwm_value, print_time, runtime)
 
@@ -476,12 +712,6 @@ class SpoolUnit:
         
         return filament_length_m, mass_g
 
-    def get_name(self):
-        return self.name
-
-    def get_status_leds(self):
-        return self.status_leds
-
     def cmd_SPOOL_MOTION_CONTROL(self, gcmd):
         # Parse parameters
         enable = gcmd.get('ENABLE', None)
@@ -545,6 +775,15 @@ class SpoolUnit:
         gcmd.respond_info(f"  Filament length: {length_m:.2f} meters")
         gcmd.respond_info(f"  Filament mass: {mass_g:.1f} grams")
         gcmd.respond_info(f"  Parameters used: density={density:.2f}g/cm³, width={width:.1f}mm, filament_dia={filament_dia:.2f}mm, packing_eff={packing_eff:.2f}")
+
+    def get_name(self):
+        return self.name
+
+    def get_status(self, eventtime):
+        return {
+            'status': self.status,
+            'synced': self.synced
+        }
 
 def load_config_prefix(config):
     return SpoolUnit(config)
