@@ -155,6 +155,9 @@ class StepperHelper:
             speed = self.unload_speed
         self.stepper.do_move(movepos, speed, self.accel, sync=True)
     
+    def get_position(self):
+        return self.stepper.get_position()
+    
     def do_set_position(self, position):
         self.stepper.do_set_position(position)
     
@@ -293,6 +296,7 @@ class SpoolUnit:
         self.hub_toolhead_distance_max = config.getfloat('hub_toolhead_distance_max', 2500.0, minval=10.0)
         self.hub_toolhead_distance_min = config.getfloat('hub_toolhead_distance_min', 2500.0, minval=10.0)
         self.park_hub_distance = config.getfloat('park_hub_distance', 100.0, minval=10.0)
+        self.gear_entry_toolhead_distance = config.getfloat('gear_entry_toolhead_distance', 50.0, minval=0.0)
         
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
@@ -435,7 +439,6 @@ class SpoolUnit:
             else:
                 if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == True:
                     self.filament_hub.set_loaded_spool_unit(self)
-                    self.set_status(STATUS_LOADED)
                 else:
                     self.set_status(STATUS_ERROR)
         logging.info(f'Spool unit {self.name} status determined as: {self.status}')
@@ -447,7 +450,7 @@ class SpoolUnit:
             self.calibrate_bowden_length()
         except Exception as e:
             self.set_status(STATUS_ERROR)
-            gcmd.error(f"Error during bowden length calibration: {e}")
+            gcmd.respond_info(f"Error during bowden length calibration: {e}")
 
     def calibrate_bowden_length(self):
         if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
@@ -585,20 +588,49 @@ class SpoolUnit:
                     mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
                     hub_toolhead_distance_max = hub_toolhead_distance + (advancing_trigger_pos - init_pos)
                     hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
+                
+                
+                # Estimate position of extruder gear entry
+                self.stepper_helper.do_move(mean_pos)   # Move to mean position on buffer
+                self.toolhead.wait_moves()
+                trigger_pos_mean = self.stepper_helper.get_position()[0]
+                self.sync_to_extruder(True)
+                self.activate_extruder()
+                pos = self.toolhead.get_position()
+                retract_dist = 100.0
+                pos[3] -= retract_dist    # Move out of the extruder gears
+                self.toolhead.move(pos, speed)
+                self.toolhead.wait_moves()
+                self.sync_to_extruder(False)
+                self.restore_extruder()
+                start_pos_mean = trigger_pos_mean - retract_dist
+                self.stepper_helper.do_set_position(start_pos_mean)
+                step_size = 1.0
+                movepos = step_size + start_pos_mean
+                while not bool(self.filament_hub.query_advancing_endstop()):    # Expand against gears until advancing endstop triggered
+                    self.stepper_helper.do_move(movepos)
+                    self.toolhead.wait_moves()
+                    movepos += step_size
+                    if self.stepper_helper.get_position()[0] > trigger_pos_mean:
+                        raise Exception("Could not reach trailing endstop when estimating extruder gear entry position.")
+                trigger_pos = self.stepper_helper.get_position()[0]
+                travel_corrected = trigger_pos - start_pos_mean - (buffer_length / 2)
+                gear_entry_toolhead_distance = retract_dist - travel_corrected
 
                 # Cleanup
-                self.stepper_helper.do_move(mean_pos)                
                 self.toolhead.set_position(self.toolhead.get_position())
                 self.toolhead.wait_moves()
                 self.hub_toolhead_distance_max = hub_toolhead_distance_max
                 self.hub_toolhead_distance_min = hub_toolhead_distance_min 
                 self.park_hub_distance = hub_distance
+                self.gear_entry_toolhead_distance = gear_entry_toolhead_distance
                 self.spool_unload()
 
                 # Save config values
                 self.configfile.set(f'spool_unit {self.name}', 'hub_toolhead_distance_max', str(hub_toolhead_distance_max))
                 self.configfile.set(f'spool_unit {self.name}', 'hub_toolhead_distance_min', str(hub_toolhead_distance_min))
                 self.configfile.set(f'spool_unit {self.name}', 'park_hub_distance', str(hub_distance))
+                self.configfile.set(f'spool_unit {self.name}', 'gear_entry_toolhead_distance', str(gear_entry_toolhead_distance))
 
                 def format_macro(macro: str) -> str:
                     return f'<a class="command">{macro}</a>'
@@ -606,7 +638,8 @@ class SpoolUnit:
                 self.gcode.respond_info(
                     f"Estimated park_hub_distance: {int(round(hub_distance))} mm\n"
                     f"Estimated hub_toolhead_distance_min: {int(round(hub_toolhead_distance_min))} mm\n"
-                    f"Estimated hub_toolhead_distance_max: {int(round(hub_toolhead_distance_max))} mm"
+                    f"Estimated hub_toolhead_distance_max: {int(round(hub_toolhead_distance_max))} mm\n"
+                    f"Estimated gear_entry_toolhead_distance: {int(round(gear_entry_toolhead_distance))} mm"
                 )
 
                 self.gcode.respond_info(
@@ -622,7 +655,6 @@ class SpoolUnit:
                 raise Exception(f"Error during calibration: {e}")
         else:
             raise Exception("Spool unit must be in IDLE or LOADED state to perform calibration")
-            
 
     def sync_to_extruder(self, state):
         if self.synced == state:
@@ -729,7 +761,7 @@ class SpoolUnit:
                 self.set_status(STATUS_LOADING)
                 self.stepper_helper.do_move('some distance...') # Course move
                 # Program iterative move here later
-                # Sync to toolhead
+                self.sync_to_extruder(True)
                 self.set_status(STATUS_LOADED)
             except Exception as e:
                 self.set_status(STATUS_ERROR)
