@@ -8,8 +8,8 @@ import math
 import logging
 import traceback
 import configparser
-from configfile import ConfigWrapper
-from .led_effect import ledEffect
+from configfile import ConfigWrapper # type: ignore
+from .led_effect import ledEffect # type: ignore
 
 STATUS_UNINITIALIZED    = 'uninitialized'   # Initial state before determining actual status
 STATUS_INITIALIZING     = 'initializing'    # State detection to find initial state
