@@ -59,7 +59,9 @@ class InsertHelper:
             try:
                 self.spool_unit.set_status(STATUS_HOMING)
                 self.homing_state = True
+                self.spool_unit.stepper_helper.do_set_position(0.)
                 self.spool_unit.stepper_helper.do_homing_move(movepos=500.0, triggered=True)
+                self.spool_unit.stepper_helper.do_set_position(0.)
                 self.spool_unit.stepper_helper.do_move(movepos=-10.0)
                 self.homing_state = False
                 self.spool_unit.set_status(STATUS_IDLE)
@@ -113,6 +115,8 @@ class StepperHelper:
         if self.stepper is None:
             raise self.config.error("Could not find stepper '%s'" % stepper_name)
         
+        self.toolhead = self.printer.lookup_object('toolhead')
+        
         # Intercept stepper trapq_append and wipe_trapq function to extract motion data
         self.trapq_append_original = self.stepper.trapq_append
         self.stepper.trapq_append = self._trapq_append_intercept
@@ -142,9 +146,7 @@ class StepperHelper:
         return bool(state)
 
     def do_homing_move(self, movepos, triggered):
-        self.stepper.do_set_position(0.)
         self.stepper.do_homing_move(movepos, self.homing_speed, self.accel, triggered, check_trigger=True)
-        self.stepper.do_set_position(0.)
     
     def do_move(self, movepos):
         if movepos >=0:
@@ -268,13 +270,15 @@ class SpoolUnit:
         self.moved_distance = 0.
         self.can_extrude_original = None
         self.synced = False
+        self.previous_extruder = None
 
         # Register handlers
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
         # Register required objects
-        self.gcode = self.printer.lookup_object('gcode')      
+        self.gcode = self.printer.lookup_object('gcode')
+        self.configfile = self.printer.lookup_object('configfile')      
 
         # Read config section
         self.name = config.get_name().split()[1]
@@ -286,6 +290,9 @@ class SpoolUnit:
         self.filament_hub_name = config.get('filament_hub', None)
         self.toolhead_sensor_name = config.get('toolhead_sensor', None)
         self.extruder_name = config.get('extruder', 'extruder')
+        self.hub_toolhead_distance_max = config.getfloat('hub_toolhead_distance_max', 2500.0, minval=10.0)
+        self.hub_toolhead_distance_min = config.getfloat('hub_toolhead_distance_min', 2500.0, minval=10.0)
+        self.park_hub_distance = config.getfloat('park_hub_distance', 100.0, minval=10.0)
         
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
@@ -326,6 +333,9 @@ class SpoolUnit:
         self.gcode.register_mux_command('LOAD_SPOOL', 'SPOOL', self.name,
                                         self.cmd_LOAD_SPOOL,
                                         desc="Load filament from spool unit to toolhead.")
+        self.gcode.register_mux_command('UNLOAD_SPOOL', 'SPOOL', self.name,
+                                        self.cmd_SPOOL_UNLOAD,
+                                        desc="Unload filament from toolhead to spool unit.")
         self.gcode.register_mux_command('CALIBRATE_BOWDEN_LENGTH', 'SPOOL', self.name,
                                         self.cmd_CALIBRATE_BOWDEN_LENGTH,
                                         desc="Calibrate the bowden length from spool unit to toolhead.")
@@ -380,13 +390,15 @@ class SpoolUnit:
             if self.vl6180 is None:
                 raise self.config.error("Could not find vl6180 '%s'" % self.vl6180_name)
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
-    
-           
+             
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
 
     def cmd_LOAD_SPOOL(self, gcmd):
         self.spool_load()
+    
+    def cmd_SPOOL_UNLOAD(self, gcmd):
+        self.spool_unload()
 
     def set_status(self, status):
         if self.status == status:
@@ -411,7 +423,9 @@ class SpoolUnit:
         elif self.sensor_states.get('pre_gate_sensor') == True:
             if self.sensor_states.get('post_gear_sensor') == False:
                 try:
+                    self.stepper_helper.do_set_position(0.)
                     self.stepper_helper.do_homing_move(movepos=50.0, triggered=True)
+                    self.stepper_helper.do_set_position(0.)
                     self.stepper_helper.do_move(movepos=-10.0)
                     self.stepper_helper.do_set_position(0.)
                     self.set_status(STATUS_IDLE)
@@ -427,8 +441,283 @@ class SpoolUnit:
         logging.info(f'Spool unit {self.name} status determined as: {self.status}')
         return self.reactor.NEVER        
 
-    def spool_load(self):
+    
+    def cmd_CALIBRATE_BOWDEN_LENGTH(self, gcmd):
+        try:
+            self.calibrate_bowden_length()
+        except Exception as e:
+            self.set_status(STATUS_ERROR)
+            gcmd.error(f"Error during bowden length calibration: {e}")
+
+    def calibrate_bowden_length(self):
         if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
+            # Check shared hub sensor state and unload
+            loaded_spool = self.filament_hub.get_loaded_spool_unit()
+            if loaded_spool is self:
+                self.spool_unload()
+            elif loaded_spool is not None:
+                loaded_spool.spool_unload()
+            self.set_status(STATUS_CALIBRATING)
+            try:
+                # Preheat extruder if needed
+                self.check_set_extruder_temp(wait=False)
+
+                # Reposition filament at correct distance from post-gear sensor
+                self.stepper_helper.do_set_position(0.)
+                self.stepper_helper.do_homing_move(movepos=50.0, triggered=True)
+                self.stepper_helper.do_set_position(0.)
+                self.stepper_helper.do_move(movepos=-10.0)
+                self.stepper_helper.do_set_position(0.)
+                
+                # Estimate filament hub sensor distance
+                step_size = 1.0
+                movepos = step_size 
+                while not self.filament_hub.query_hub_endstop():
+                    self.stepper_helper.do_move(movepos)
+                    self.toolhead.wait_moves()
+                    movepos += step_size
+                    if movepos > self.park_hub_distance + 20.0:
+                        raise Exception("Filament hub endstop not triggered within expected range during calibration.")
+                hub_distance = self.stepper_helper.stepper.get_position()[0]
+
+                # Estimate toolhead sensor distance
+                self.sync_to_extruder(True)
+                self.activate_extruder()
+                self.check_set_extruder_temp(wait=True) # Ensure extruder is hot enough to allow motion
+                speed = self.stepper_helper.homing_speed
+                step_size = 10.0    # Coarse step size due to large distance
+                pos = self.toolhead.get_position()
+                init_pos = pos[3]
+                pos[3] += step_size
+                while not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    self.toolhead.move(pos, speed)
+                    self.toolhead.wait_moves()
+                    pos[3] += step_size
+                    if pos[3] - init_pos > self.hub_toolhead_distance_max + 100.0:
+                        raise Exception("Toolhead sensor not triggered within expected range during calibration.")
+                # Back off and do fine steps
+                pos[3] -= 2 * step_size 
+                self.toolhead.move(pos, speed)
+                self.toolhead.wait_moves()
+                step_size = 1.0    # Fine step size for accurate measurement
+                inter_pos = pos[3]
+                pos[3] += step_size
+                while not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    self.toolhead.move(pos, speed)
+                    self.toolhead.wait_moves()
+                    pos[3] += step_size
+                    if pos[3] - inter_pos > 50.0:
+                        raise Exception("Toolhead sensor not triggered within expected range during calibration.")
+                hub_toolhead_distance = pos[3] - init_pos - step_size
+                self.restore_extruder()
+                self.sync_to_extruder(False)
+                
+                # Estimate buffer length and calculate min/max positions for toolhead sensor
+                advance_state = bool(self.filament_hub.query_advancing_endstop())
+                trailing_state = bool(self.filament_hub.query_trailing_endstop())
+                step_size = 1.0
+                movepos = self.stepper_helper.stepper.get_position()[0]
+                init_pos = movepos
+                if advance_state and trailing_state:        # Invalid state
+                    raise Exception("Both buffer endstops are triggered! Cannot calibrate buffer length.")
+                elif advance_state and not trailing_state:  # Fully extended state
+                    movepos -= step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                        if movepos - init_pos < -100.0:
+                            raise Exception("Trailing endstop not triggered within expected range during calibration.")
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos += 2 * step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                        if movepos - init_pos > 100.0:
+                            raise Exception("Advancing endstop not triggered within expected range during calibration.")
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    correction_length = advancing_trigger_pos - init_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_max = hub_toolhead_distance + correction_length
+                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
+                elif not advance_state and trailing_state:  # Fully retracted state
+                    movepos += step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                        if movepos - init_pos > 100.0:
+                            raise Exception("Advancing endstop not triggered within expected range during calibration.")
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos -= 2 * step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                        if movepos - init_pos < -100.0:
+                            raise Exception("Trailing endstop not triggered within expected range during calibration.")
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    correction_length = trailing_trigger_pos - init_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_min = hub_toolhead_distance + correction_length
+                    hub_toolhead_distance_max = hub_toolhead_distance_min + buffer_length
+                else:                                       # Somewhere in between  
+                    movepos -= step_size     
+                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos -= step_size
+                        if movepos - init_pos < -100.0:
+                            raise Exception("Trailing endstop not triggered within expected range during calibration.")
+                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    movepos += 2 * step_size
+                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
+                        self.stepper_helper.do_move(movepos)
+                        self.toolhead.wait_moves()
+                        movepos += step_size
+                        if movepos - init_pos > 100.0:
+                            raise Exception("Advancing endstop not triggered within expected range during calibration.")
+                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
+                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
+                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
+                    hub_toolhead_distance_max = hub_toolhead_distance + (advancing_trigger_pos - init_pos)
+                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
+
+                # Cleanup
+                self.stepper_helper.do_move(mean_pos)                
+                self.toolhead.set_position(self.toolhead.get_position())
+                self.toolhead.wait_moves()
+                self.hub_toolhead_distance_max = hub_toolhead_distance_max
+                self.hub_toolhead_distance_min = hub_toolhead_distance_min 
+                self.park_hub_distance = hub_distance
+                self.spool_unload()
+
+                # Save config values
+                self.configfile.set(f'spool_unit {self.name}', 'hub_toolhead_distance_max', str(hub_toolhead_distance_max))
+                self.configfile.set(f'spool_unit {self.name}', 'hub_toolhead_distance_min', str(hub_toolhead_distance_min))
+                self.configfile.set(f'spool_unit {self.name}', 'park_hub_distance', str(hub_distance))
+
+                def format_macro(macro: str) -> str:
+                    return f'<a class="command">{macro}</a>'
+                
+                self.gcode.respond_info(
+                    f"Estimated park_hub_distance: {int(round(hub_distance))} mm\n"
+                    f"Estimated hub_toolhead_distance_min: {int(round(hub_toolhead_distance_min))} mm\n"
+                    f"Estimated hub_toolhead_distance_max: {int(round(hub_toolhead_distance_max))} mm"
+                )
+
+                self.gcode.respond_info(
+                    f"Calibration completed successfully for spool_unit {self.name}.\n"
+                    f"Please use {format_macro('SAVE_CONFIG')} to save the calibration values."
+                )
+
+                self.set_status(STATUS_IDLE)
+
+            except Exception as e:
+                self.set_status(STATUS_ERROR)
+                logging.error(f"Error during calibration: {e}")
+                raise Exception(f"Error during calibration: {e}")
+        else:
+            raise Exception("Spool unit must be in IDLE or LOADED state to perform calibration")
+            
+
+    def sync_to_extruder(self, state):
+        if self.synced == state:
+            return
+        try:
+            if state:
+                self.toolhead.wait_moves()
+                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, self.extruder_name)
+            else:
+                self.toolhead.wait_moves()
+                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, None)
+            self.synced = state
+        except Exception as e:
+            logging.error(f"Error during extruder sync: {e}")
+            logging.error(traceback.format_exc())
+            return
+           
+    def activate_extruder(self):
+        if self.toolhead.get_extruder() == self.extruder:
+            return
+        self.previous_extruder = self.toolhead.get_extruder()
+        self.toolhead.flush_step_generation()
+        self.toolhead.set_extruder(self.extruder, self.extruder.last_position)
+        self.printer.send_event("extruder:activate_extruder")
+        self.toolhead.wait_moves()
+    
+    def restore_extruder(self):
+        if self.previous_extruder is None or self.previous_extruder == self.extruder:
+            return
+        self.toolhead.flush_step_generation()
+        self.toolhead.set_extruder(self.previous_extruder, self.previous_extruder.last_position)
+        self.printer.send_event("extruder:activate_extruder")
+        self.toolhead.wait_moves()
+
+    def check_set_extruder_temp(self, wait=False):
+        pheaters = self.printer.lookup_object('heaters')
+        min_temp = self.extruder.heater.min_extrude_temp
+        target_temp = self.extruder.heater.target_temp
+        
+        if not self.extruder.heater.can_extrude:
+            # Extruder is too cold, heat it up
+            if target_temp < min_temp:
+                # No valid target set, use min_extrude_temp + margin
+                pheaters.set_temperature(self.extruder.get_heater(), min_temp + 10., wait)
+            else:
+                # Target already set appropriately, wait if requested
+                if wait:
+                    pheaters.set_temperature(self.extruder.get_heater(), target_temp, wait)
+        else:
+            # Extruder is hot enough now, but check if target would cool it below threshold
+            if target_temp < min_temp:
+                # Target is too low, would cool down - prevent this
+                pheaters.set_temperature(self.extruder.get_heater(), min_temp + 10., wait=False)
+
+    def spool_unload(self):
+        if self.status == STATUS_LOADED or self.status == STATUS_ERROR or self.status == STATUS_CALIBRATING:
+            try:
+                if self.status != STATUS_CALIBRATING:
+                    self.set_status(STATUS_UNLOADING)
+                self.check_set_extruder_temp(wait=True)
+                # Cut filament here potentially? Ideally cut before parking?
+                self.hbridge_motor.scheduled_motion(pwm_value=-1.0) # Reverse spool to keep tension
+                self.sync_to_extruder(True)
+                self.activate_extruder()
+                speed = self.stepper_helper.unload_speed
+                movepos = self.toolhead.get_position()
+                movepos[3] -= 100.0     # Ideally get toolhead_sensor - end_of_bowden distance
+                self.toolhead.move(movepos, speed)
+                self.toolhead.wait_moves()
+                self.hbridge_motor.scheduled_motion(pwm_value=0)
+                self.toolhead.set_position(self.toolhead.get_position()) # Cleanup position
+                self.restore_extruder()
+                self.sync_to_extruder(False)
+                if self.hub_toolhead_distance_max and self.park_hub_distance:
+                    movepos = -(self.hub_toolhead_distance_max + self.park_hub_distance)
+                else:
+                    movepos = -2000.0
+                self.stepper_helper.do_set_position(0.)
+                self.stepper_helper.do_homing_move(movepos=movepos, triggered=False)
+                movepos -= 10.0
+                self.stepper_helper.do_move(movepos)
+                self.stepper_helper.do_set_position(0.)
+                if self.status != STATUS_CALIBRATING:
+                    self.set_status(STATUS_IDLE)
+
+            except Exception as e:
+                self.set_status(STATUS_ERROR)
+                logging.info(f"Error during spool unload: {e}")
+                return
+        else:
+            logging.error("Spool unit must be in LOADED or ERROR state to perform unload")
+            return
+    
+    def spool_load(self):
+        if self.status == STATUS_IDLE:
             # Check shared hub sensor state and unload if required
             loaded_spool = self.filament_hub.get_loaded_spool_unit()
             if loaded_spool is self:
@@ -446,151 +735,6 @@ class SpoolUnit:
                 self.set_status(STATUS_ERROR)
                 logging.error(f"Error during spool load: {e}")
                 return
-    
-    def cmd_CALIBRATE_BOWDEN_LENGTH(self, gcmd):
-        self.calibrate_bowden_length()
-
-    def calibrate_bowden_length(self):
-        if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
-            # Check shared hub sensor state and unload
-            loaded_spool = self.filament_hub.get_loaded_spool_unit()
-            if loaded_spool is self:
-                self.spool_unload()
-            elif loaded_spool is not None:
-                loaded_spool.spool_unload()
-            self.set_status(STATUS_CALIBRATING)
-            try:
-                # Reposition filament at correct distance from post-gear sensor
-                self.stepper_helper.do_homing_move(movepos=50.0, triggered=True)
-                self.stepper_helper.do_move(movepos=-10.0)
-                self.stepper_helper.do_set_position(0.)
-                
-                # Estimate filament hub sensor distance
-                step_size = 1.0
-                movepos = step_size 
-                while not self.filament_hub.query_hub_endstop():
-                    self.stepper_helper.do_move(movepos)
-                    self.toolhead.wait_moves()
-                    movepos += step_size
-                hub_distance = self.stepper_helper.stepper.get_position()[0]
-                logging.info(f"Calibrated filament hub sensor distance: {hub_distance} mm")
-
-                # Estimate toolhead sensor distance
-                self.sync_to_extruder(True)
-                speed = self.stepper_helper.homing_speed
-                step_size = 10.0    # Coarse step size due to large distance
-                pos = self.toolhead.get_position()
-                init_pos = pos[3]
-                pos[3] += step_size
-                while not bool(self.toolhead_sensor.runout_helper.filament_present):
-                    self.toolhead.move(pos, speed)
-                    self.toolhead.wait_moves()
-                    pos[3] += step_size
-                # Back off and do fine steps
-                pos[3] -= 2 * step_size 
-                self.toolhead.move(pos, speed)
-                self.toolhead.wait_moves()
-                step_size = 1.0    # Fine step size for accurate measurement
-                pos[3] += step_size
-                while not bool(self.toolhead_sensor.runout_helper.filament_present):
-                    self.toolhead.move(pos, speed)
-                    self.toolhead.wait_moves()
-                    pos[3] += step_size
-                hub_toolhead_distance = pos[3] - init_pos - step_size
-                self.sync_to_extruder(False)
-                
-                # Estimate buffer length and calculate min/max positions for toolhead sensor
-                advance_state = bool(self.filament_hub.query_advancing_endstop())
-                trailing_state = bool(self.filament_hub.query_trailing_endstop())
-                step_size = 1.0
-                movepos = self.stepper_helper.stepper.get_position()[0]
-                init_pos = movepos
-                if advance_state and trailing_state:        # Invalid state
-                    raise Exception("Both buffer endstops are triggered! Cannot calibrate buffer length.")
-                elif advance_state and not trailing_state:  # Fully extended state
-                    movepos -= step_size     
-                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos -= step_size
-                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    movepos += 2 * step_size
-                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos += step_size
-                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
-                    correction_length = advancing_trigger_pos - init_pos
-                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
-                    hub_toolhead_distance_max = hub_toolhead_distance + correction_length
-                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
-                elif not advance_state and trailing_state:  # Fully retracted state
-                    movepos += step_size
-                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos += step_size
-                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    movepos -= 2 * step_size     
-                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos -= step_size
-                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
-                    correction_length = trailing_trigger_pos - init_pos
-                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
-                    hub_toolhead_distance_min = hub_toolhead_distance + correction_length
-                    hub_toolhead_distance_max = hub_toolhead_distance_min + buffer_length
-                else:                                       # Somewhere in between  
-                    movepos -= step_size     
-                    while not bool(self.filament_hub.query_trailing_endstop()):     # Retract until trailing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos -= step_size
-                    trailing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    movepos += 2 * step_size
-                    while not bool(self.filament_hub.query_advancing_endstop()):    # Advance until advancing endstop triggered
-                        self.stepper_helper.do_move(movepos)
-                        self.toolhead.wait_moves()
-                        movepos += step_size
-                    advancing_trigger_pos = self.stepper_helper.stepper.get_position()[0]
-                    buffer_length = advancing_trigger_pos - trailing_trigger_pos
-                    mean_pos = (advancing_trigger_pos + trailing_trigger_pos) / 2
-                    hub_toolhead_distance_max = hub_toolhead_distance + (advancing_trigger_pos - init_pos)
-                    hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
-                logging.info(f"Calibrated filament hub to toolhead distance range: {hub_toolhead_distance_min} mm - {hub_toolhead_distance_max} mm")
-
-                # Move to mean position
-                self.stepper_helper.do_move(mean_pos)                
-                
-                self.set_status(STATUS_IDLE)
-
-            except Exception as e:
-                self.set_status(STATUS_ERROR)
-                logging.error(f"Error during calibration: {e}")
-                return
-        else:
-            logging.error("Calibration cannot be performed unless spool is in IDLE or LOADED state")
-            return
-
-    def sync_to_extruder(self, state):
-        if self.synced == state:
-            return
-        try:
-            if state:
-                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, self.extruder_name)
-            else:
-                self.axis_sync.sync_stepper_to_extruder(self.stepper_name, None)
-            self.synced = state
-        except Exception as e:
-            logging.error(f"Error during extruder sync: {e}")
-            logging.error(traceback.format_exc())
-            return   
-
-    def spool_unload(self):
-        pass
 
     def motion_extraction(self, *args):
         print_time = args[1]
