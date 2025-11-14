@@ -792,6 +792,7 @@ class SpoolUnit:
                 ### Finalize loading until park position here
                 self.toolhead.set_position(self.toolhead.get_position())
                 self.restore_extruder()
+                self.filament_hub.set_loaded_spool_unit(self)
                 self.set_status(STATUS_LOADED)
 
             except Exception as e:
