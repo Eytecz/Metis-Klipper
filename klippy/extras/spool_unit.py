@@ -101,9 +101,9 @@ class StepperHelper:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         
         # Optional config sections
-        self.load_speed = config.getfloat('load_speed', 50.0, minval=1.0)
-        self.unload_speed = config.getfloat('unload_speed', 50.0, minval=1.0)
-        self.homing_speed = config.getfloat('homing_speed', 25.0, minval=1.0)
+        self.load_speed = config.getfloat('load_speed', 100.0, minval=1.0)
+        self.unload_speed = config.getfloat('unload_speed', 100.0, minval=1.0)
+        self.homing_speed = config.getfloat('homing_speed', 50.0, minval=1.0)
         self.accel = config.getfloat('accel', 1000.0, minval=1.0)
 
     def handle_connect(self):
@@ -293,10 +293,10 @@ class SpoolUnit:
         self.filament_hub_name = config.get('filament_hub', None)
         self.toolhead_sensor_name = config.get('toolhead_sensor', None)
         self.extruder_name = config.get('extruder', 'extruder')
-        self.hub_toolhead_distance_max = config.getfloat('hub_toolhead_distance_max', 2500.0, minval=10.0)
-        self.hub_toolhead_distance_min = config.getfloat('hub_toolhead_distance_min', 2500.0, minval=10.0)
-        self.park_hub_distance = config.getfloat('park_hub_distance', 100.0, minval=10.0)
-        self.gear_entry_toolhead_distance = config.getfloat('gear_entry_toolhead_distance', 50.0, minval=0.0)
+        self.hub_toolhead_distance_max = config.getfloat('hub_toolhead_distance_max', None)
+        self.hub_toolhead_distance_min = config.getfloat('hub_toolhead_distance_min', None)
+        self.park_hub_distance = config.getfloat('park_hub_distance', None)
+        self.gear_entry_toolhead_distance = config.getfloat('gear_entry_toolhead_distance', None)
         
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
@@ -589,7 +589,6 @@ class SpoolUnit:
                     hub_toolhead_distance_max = hub_toolhead_distance + (advancing_trigger_pos - init_pos)
                     hub_toolhead_distance_min = hub_toolhead_distance_max - buffer_length
                 
-                
                 # Estimate position of extruder gear entry
                 self.stepper_helper.do_move(mean_pos)   # Move to mean position on buffer
                 self.toolhead.wait_moves()
@@ -597,7 +596,7 @@ class SpoolUnit:
                 self.sync_to_extruder(True)
                 self.activate_extruder()
                 pos = self.toolhead.get_position()
-                retract_dist = 100.0
+                retract_dist = 50.0
                 pos[3] -= retract_dist    # Move out of the extruder gears
                 self.toolhead.move(pos, speed)
                 self.toolhead.wait_moves()
@@ -721,7 +720,7 @@ class SpoolUnit:
                 self.activate_extruder()
                 speed = self.stepper_helper.unload_speed
                 movepos = self.toolhead.get_position()
-                movepos[3] -= 100.0     # Ideally get toolhead_sensor - end_of_bowden distance
+                movepos[3] -= 50.0     # Ideally get toolhead_sensor - end_of_bowden distance
                 self.toolhead.move(movepos, speed)
                 self.toolhead.wait_moves()
                 self.hbridge_motor.scheduled_motion(pwm_value=0)
@@ -759,10 +758,42 @@ class SpoolUnit:
             # Load filament to toolhead
             try:
                 self.set_status(STATUS_LOADING)
-                self.stepper_helper.do_move('some distance...') # Course move
-                # Program iterative move here later
+                self.check_set_extruder_temp(wait=False)
+                self.stepper_helper.do_set_position(0.)
+                movepos = (self.hub_toolhead_distance_min - self.gear_entry_toolhead_distance +
+                           self.park_hub_distance)
+                self.stepper_helper.do_move(movepos)    # Move to (almost) touching extruder gears
+                self.toolhead.wait_moves()
                 self.sync_to_extruder(True)
+                self.activate_extruder()
+                self.check_set_extruder_temp(wait=True) # Ensure extruder is hot enough to allow motion
+                dist_max = (self.hub_toolhead_distance_max - self.hub_toolhead_distance_min +
+                             self.gear_entry_toolhead_distance) + 20.0
+                speed = self.stepper_helper.load_speed
+                step_size = 1.0
+                dist = 0.0
+                pos = self.toolhead.get_position()
+                pos[3] += step_size
+                while not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    self.toolhead.move(pos, speed)
+                    self.toolhead.wait_moves()
+                    pos[3] += step_size
+                    dist += step_size
+                    if dist > dist_max:
+                        raise Exception("Toolhead sensor not triggered within expected range during spool load.")
+                buffer_mean_pos = ((self.hub_toolhead_distance_max + self.hub_toolhead_distance_min)/2 +
+                                   self.park_hub_distance)
+                correction_dist = buffer_mean_pos - movepos - dist
+                self.sync_to_extruder(False)
+                movepos = self.stepper_helper.get_position()[0] + correction_dist
+                self.stepper_helper.do_move(movepos)
+                self.toolhead.wait_moves()
+                self.sync_to_extruder(True)
+                ### Finalize loading until park position here
+                self.toolhead.set_position(self.toolhead.get_position())
+                self.restore_extruder()
                 self.set_status(STATUS_LOADED)
+
             except Exception as e:
                 self.set_status(STATUS_ERROR)
                 logging.error(f"Error during spool load: {e}")
