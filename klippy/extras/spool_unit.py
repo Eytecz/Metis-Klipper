@@ -22,6 +22,7 @@ STATUS_UNLOADING        = 'unloading'       # Automated unloading as effect of e
 STATUS_RUNOUT           = 'runout'          # Filament runout detected during printing on pre-gate sensor
 STATUS_ERROR            = 'error'           # Exception occurred during homing/loading/unloading
 STATUS_CALIBRATING      = 'calibrating'     # Automated calibration processes ongoing
+STATUS_EJECTING         = 'ejecting'        # Automated ejection of filament from spool unit
 
 class InsertHelper:
     def __init__(self, config, spool_unit):
@@ -71,7 +72,7 @@ class InsertHelper:
                 logging.error(f"Error during insert event handling: {e}")
 
     def _runout_event_handler(self, eventtime):
-        self.spool_unit.set_status(STATUS_EMPTY)
+        self.spool_unit.runout_event_handler(eventtime)
         logging.info(f"Runout event triggered at {eventtime}")
     
     def query_endstop(self):
@@ -183,6 +184,7 @@ class LEDHelper:
                                 breathing     2  0     difference (1.0, 0.0, 0.0, 0.0)
                                 static        1  0     top        (1.0, 0.0, 0.0, 0.0)"""
         LAYER_CALIBRATING  = """breathing     2  1     top        (1.0, 1.0, 0.0, 0.0)"""
+        LAYER_EJECTING     = """breathing     2  1     top        (0.0, 0.0, 0.0, 1.0)"""
         
         # Read config section
         self.state_layers = {
@@ -195,7 +197,8 @@ class LEDHelper:
             STATUS_UNLOADING:       config.get('state_layer_unloading', LAYER_UNLOADING),
             STATUS_RUNOUT:          config.get('state_layer_runout', LAYER_RUNOUT),
             STATUS_ERROR:           config.get('state_layer_error', LAYER_ERROR),
-            STATUS_CALIBRATING:     config.get('state_layer_calibrating', LAYER_CALIBRATING)
+            STATUS_CALIBRATING:     config.get('state_layer_calibrating', LAYER_CALIBRATING),
+            STATUS_EJECTING:        config.get('state_layer_ejecting', LAYER_EJECTING)
             }
         self.frame_rate = config.getfloat('frame_rate', default=24, minval=1, maxval=60)
         self.status_leds = config.get('status_leds')
@@ -298,6 +301,13 @@ class SpoolUnit:
         self.park_hub_distance = config.getfloat('park_hub_distance', None)
         self.gear_entry_toolhead_distance = config.getfloat('gear_entry_toolhead_distance', None)
         
+        self.runout_pause = config.getboolean('pause_on_runout', True)
+        self.runout_eject = config.getboolean('eject_on_runout', False)
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        if self.runout_pause or config.get('runout_gcode', None) is not None:
+            self.runout_gcode = gcode_macro.load_template(
+                config, 'runout_gcode', '')
+        
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
@@ -335,11 +345,14 @@ class SpoolUnit:
                                         self.cmd_SET_STATUS,
                                         desc="Set the status of the spool unit for LED indication.")
         self.gcode.register_mux_command('LOAD_SPOOL', 'SPOOL', self.name,
-                                        self.cmd_LOAD_SPOOL,
+                                        self.cmd_SPOOL_LOAD,
                                         desc="Load filament from spool unit to toolhead.")
         self.gcode.register_mux_command('UNLOAD_SPOOL', 'SPOOL', self.name,
                                         self.cmd_SPOOL_UNLOAD,
                                         desc="Unload filament from toolhead to spool unit.")
+        self.gcode.register_mux_command('EJECT_SPOOL', 'SPOOL', self.name,
+                                        self.cmd_SPOOL_EJECT,
+                                        desc="Eject filament completely from spool unit.")
         self.gcode.register_mux_command('CALIBRATE_BOWDEN_LENGTH', 'SPOOL', self.name,
                                         self.cmd_CALIBRATE_BOWDEN_LENGTH,
                                         desc="Calibrate the bowden length from spool unit to toolhead.")
@@ -398,11 +411,26 @@ class SpoolUnit:
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
 
-    def cmd_LOAD_SPOOL(self, gcmd):
-        self.spool_load()
-    
+    def cmd_SPOOL_LOAD(self, gcmd):
+        try:
+            self.spool_load()
+        except Exception as e:
+            self.set_status(STATUS_ERROR)
+            gcmd.respond_info(f"Error during spool load: {e}")
+
     def cmd_SPOOL_UNLOAD(self, gcmd):
-        self.spool_unload()
+        try:
+            self.spool_unload()
+        except Exception as e:
+            self.set_status(STATUS_ERROR)
+            gcmd.respond_info(f"Error during spool unload: {e}")
+
+    def cmd_SPOOL_EJECT(self, gcmd):
+        try:
+            self.spool_eject()
+        except Exception as e:
+            self.set_status(STATUS_ERROR)
+            gcmd.respond_info(f"Error during spool eject: {e}")
 
     def set_status(self, status):
         if self.status == status:
@@ -439,6 +467,8 @@ class SpoolUnit:
             else:
                 if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == True:
                     self.filament_hub.set_loaded_spool_unit(self)
+                    self.sync_to_extruder(True)
+                    self.set_status(STATUS_LOADED)
                 else:
                     self.set_status(STATUS_ERROR)
         logging.info(f'Spool unit {self.name} status determined as: {self.status}')
@@ -709,7 +739,7 @@ class SpoolUnit:
                 pheaters.set_temperature(self.extruder.get_heater(), min_temp + 10., wait=False)
 
     def spool_unload(self):
-        if self.status == STATUS_LOADED or self.status == STATUS_ERROR or self.status == STATUS_CALIBRATING:
+        if self.status == STATUS_LOADED or self.status == STATUS_ERROR or self.status == STATUS_CALIBRATING or self.status == STATUS_RUNOUT:
             try:
                 if self.status != STATUS_CALIBRATING:
                     self.set_status(STATUS_UNLOADING)
@@ -799,6 +829,72 @@ class SpoolUnit:
                 self.set_status(STATUS_ERROR)
                 logging.error(f"Error during spool load: {e}")
                 return
+
+    def spool_eject(self):
+        if self.status in [STATUS_IDLE, STATUS_LOADED, STATUS_ERROR, STATUS_RUNOUT]:
+            if self.status == STATUS_LOADED or self.status == STATUS_ERROR or self.status == STATUS_RUNOUT:
+                try:
+                    self.spool_unload()
+                except Exception as e:
+                    self.set_status(STATUS_ERROR)
+                    logging.error(f"Error during spool unload: {e}")
+                    return
+            try:
+                self.set_status(STATUS_EJECTING)
+                self.stepper_helper.do_set_position(0.)
+                self.stepper_helper.do_move(movepos=-20.0) # Move out of gears
+                self.toolhead.wait_moves()
+
+                def check_for_runout(eventtime):
+                    if self.status != STATUS_EMPTY:
+                        self.set_status(STATUS_ERROR)
+                        self.gcode.respond_info(f"Runout is not detected on spool {self.name} during ejection!\n"
+                                                f"Please manually clear the filament path.")
+                    return self.reactor.NEVER
+                
+                runtime = 20.0
+                self.eject_timer = self.reactor.register_timer(check_for_runout, self.reactor.monotonic() + runtime)
+                self.hbridge_motor.scheduled_motion(pwm_value=-1.0, runtime=runtime) # Reverse spool to eject
+
+            except Exception as e:
+                self.set_status(STATUS_ERROR)
+                logging.error(f"Error during spool ejection: {e}")
+                return
+    
+    def runout_event_handler(self, eventtime):
+        if self.status == STATUS_EJECTING:
+            self.hbridge_motor.scheduled_motion(pwm_value=0)
+            if self.eject_timer:
+                self.reactor.unregister_timer(self.eject_timer)
+                self.eject_timer = None
+            self.set_status(STATUS_EMPTY)
+        else:
+            # Check printer state
+            idle_timeout = self.printer.lookup_object('idle_timeout')
+            is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
+
+            if is_printing:
+                # Check if this toolhead is active
+                if self.toolhead.get_extruder() == self.extruder:   # This toolhead is active
+                    self.set_status(STATUS_RUNOUT)
+                    pause_prefix = ""
+                    if self.runout_pause:
+                        pause_resume = self.printer.lookup_object('pause_resume')
+                        pause_resume.send_pause_command()
+                        pause_prefix = "PAUSE\n"
+                        self.reactor.pause(eventtime + 0.5)
+                        if self.runout_eject:
+                            self.spool_eject()
+                    self._exec_gcode(pause_prefix, self.runout_gcode)
+            else:                                               # Not active
+                self.set_status(STATUS_EMPTY)
+
+    def _exec_gcode(self, prefix, template):
+        try:
+            self.gcode.run_script(prefix + template.render() + "\nM400")
+        except Exception:
+            logging.exception("Script running error")
+        self.min_event_systime = self.reactor.monotonic() + self.event_delay
 
     def motion_extraction(self, *args):
         print_time = args[1]
