@@ -414,7 +414,41 @@ class SpoolUnit:
             if self.vl6180 is None:
                 raise self.config.error("Could not find vl6180 '%s'" % self.vl6180_name)
             self.spool_measurement = self.config.getboolean('spool_measurement', True)
-             
+
+    def handle_exception(self, exception, context, pause_on_error=True):
+        # Log the error with context
+        logging.error(f"Error in {context} for spool {self.name}: {exception}")
+        logging.error(traceback.format_exc())
+
+        # Set status to ERROR
+        self.set_status(STATUS_ERROR)
+
+        # Check printer status and pause if required
+        if pause_on_error:
+            idle_timeout = self.printer.lookup_object('idle_timeout')
+            is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
+            if is_printing:
+                pause_prefix = ""
+                if self.exception_pause:
+                    pause_resume = self.printer.lookup_object('pause_resume')
+                    pause_resume.send_pause_command()
+                    pause_prefix = "PAUSE\n"
+                    self.reactor.pause(self.reactor.monotonic() + 0.5)
+                self._exec_gcode(pause_prefix, self.exception_gcode)
+                self.gcode.respond_info(
+                    f"Exception occurred in {context} for spool unit {self.name}\n"
+                    f"Exception: {str(exception)}\n"
+                    f"Printing has been paused. Please resolve the issue before resuming"
+                )
+                return self.reactor.NEVER if context == "initializing" else False
+        
+        self.gcode.respond_info(
+            f"Exception occurred in {context} for spool unit {self.name}\n"
+            f"Exception: {str(exception)}\n"
+            f"Printing has not been paused. Please resolve the issue before continuing."
+        )
+        return self.reactor.NEVER if context == "initializing" else False
+
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
 
@@ -897,44 +931,7 @@ class SpoolUnit:
             self.gcode.run_script(prefix + template.render() + "\nM400")
         except Exception as e:
             return self.handle_exception(e, "_exec_gcode", pause_on_error=True)
-
-    def handle_exception(self, exception, context, pause_on_error=True):
-        # Log the error with context
-        logging.error(f"Error in {context} for spool {self.name}: {exception}")
-        logging.error(traceback.format_exc())
-
-        # Set status to ERROR
-        self.set_status(STATUS_ERROR)
-
-        # Check printer status and pause if required
-        if pause_on_error:
-            idle_timeout = self.printer.lookup_object('idle_timeout')
-            is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
-            if is_printing:
-                pause_prefix = ""
-                if self.exception_pause:
-                    pause_resume = self.printer.lookup_object('pause_resume')
-                    pause_resume.send_pause_command()
-                    pause_prefix = "PAUSE\n"
-                    self.reactor.pause(self.reactor.monotonic() + 0.5)
-                self._exec_gcode(pause_prefix, self.exception_gcode)
-                self.gcode.respond_info(
-                    f"Exception occurred in {context} for spool unit {self.name}\n"
-                    f"Exception: {str(exception)}\n"
-                    f"Printing has been paused. Please resolve the issue before resuming"
-                )
-                return self.reactor.NEVER
-        
-        self.gcode.respond_info(
-            f"Exception occurred in {context} for spool unit {self.name}\n"
-            f"Exception: {str(exception)}\n"
-            f"Printing has not been paused. Please resolve the issue before continuing."
-        )
-        return self.reactor.NEVER
             
-                
-
-
     def motion_extraction(self, *args):
         print_time = args[1]
         runtime = args[2] + args[3] + args[4]
