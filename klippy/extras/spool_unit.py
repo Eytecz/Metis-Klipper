@@ -59,6 +59,7 @@ class InsertHelper:
         if self.insert_load and not self.homing_state:
             try:
                 self.spool_unit.set_status(STATUS_HOMING)
+                self.spool_unit.sync_to_extruder(False)
                 self.homing_state = True
                 self.spool_unit.stepper_helper.do_set_position(0.)
                 self.spool_unit.stepper_helper.do_homing_move(movepos=500.0, triggered=True)
@@ -71,9 +72,9 @@ class InsertHelper:
                 return self.spool_unit.handle_exception(e, "insert event handling", pause_on_error=False)
 
     def _runout_event_handler(self, eventtime):
-        self.spool_unit.runout_event_handler(eventtime)
         logging.info(f"Runout event triggered at {eventtime}")
-    
+        self.spool_unit.runout_event_handler(eventtime)
+        
     def query_endstop(self):
         return self.filament_present
 
@@ -348,6 +349,9 @@ class SpoolUnit:
         self.gcode.register_mux_command('SET_STATUS', 'SPOOL', self.name,
                                         self.cmd_SET_STATUS,
                                         desc="Set the status of the spool unit for LED indication.")
+        self.gcode.register_mux_command('QUERY_SPOOL_UNIT', 'SPOOL', self.name,
+                                        self.cmd_QUERY_SPOOL_UNIT,
+                                        desc="Query the current status and parameters of the spool unit.")
         self.gcode.register_mux_command('CLEAR_ERROR', 'SPOOL', self.name,
                                         self.cmd_CLEAR_ERROR,
                                         desc="Clear error state and re-initialize the spool unit.")
@@ -435,22 +439,51 @@ class SpoolUnit:
                     pause_prefix = "PAUSE\n"
                     self.reactor.pause(self.reactor.monotonic() + 0.5)
                 self._exec_gcode(pause_prefix, self.exception_gcode)
-                self.gcode.respond_info(
+                msg = (
                     f"Exception occurred in {context} for spool unit {self.name}\n"
                     f"Exception: {str(exception)}\n"
-                    f"Printing has been paused. Please resolve the issue before resuming"
+                    f"Printing has been paused. Please resolve the issue before resuming."
                 )
+                self.gcode.respond_info(msg)
+                logging.info(msg)
                 return self.reactor.NEVER if context == "initializing" else False
         
-        self.gcode.respond_info(
+        msg = (
             f"Exception occurred in {context} for spool unit {self.name}\n"
             f"Exception: {str(exception)}\n"
             f"Printing has not been paused. Please resolve the issue before continuing."
         )
+        self.gcode.respond_info(msg)
+        logging.info(msg)
         return self.reactor.NEVER if context == "initializing" else False
 
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
+    
+    def cmd_QUERY_SPOOL_UNIT(self, gcmd):
+        # Get sensor states safely
+        pre_gate = bool(self.insert_helper.query_endstop()) if hasattr(self, 'insert_helper') else None
+        post_gear = bool(self.stepper_helper.query_endstop()) if hasattr(self, 'stepper_helper') else None
+        hub = bool(self.filament_hub.query_hub_endstop()) if hasattr(self, 'filament_hub') else None
+        toolhead = bool(self.toolhead_sensor.runout_helper.filament_present) if hasattr(self, 'toolhead_sensor') else None
+        
+        # Get spool diameter
+        diameter = self.estimate_spool_diameter()
+        diameter_str = f"{diameter} mm" if diameter else "n/a"
+        
+        # Format sensor states
+        def fmt(val):
+            return 'triggered' if val else ('open' if val is False else 'n/a')
+        
+        gcmd.respond_info(
+            f"Spool unit {self.name} query results:\n"
+            f"  Status: {self.status}, synced to extruder: {bool(self.synced)}\n"
+            f"  Measured spool diameter: {diameter_str}\n"
+            f"  Pre-gate sensor: {fmt(pre_gate)}\n"
+            f"  Post-gear sensor: {fmt(post_gear)}\n"
+            f"  Hub sensor: {fmt(hub)}\n"
+            f"  Toolhead sensor: {fmt(toolhead)}"
+        )
 
     def cmd_SPOOL_LOAD(self, gcmd):
         try:
@@ -493,6 +526,17 @@ class SpoolUnit:
             'hub_sensor': bool(self.filament_hub.query_hub_endstop()) if hasattr(self, 'filament_hub') else None,
             'toolhead_sensor': bool(self.toolhead_sensor.runout_helper.filament_present) if hasattr(self, 'toolhead_sensor') else None
         }
+        self.filament_hub.set_loaded_spool_unit(None)
+
+        # Catch inconsistent sensor states
+        if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == False:
+            e = "Inconsistent sensor states detected during initialization."
+            return self.handle_exception(e, "initializing", False)
+        elif self.sensor_states.get('hub_sensor') == False and self.sensor_states.get('toolhead_sensor') == True:
+            e = "Inconsistent sensor states detected during initialization."
+            return self.handle_exception(e, "initializing", False)
+        
+        # Determine status based on sensor states
         if self.sensor_states.get('pre_gate_sensor') == False:
             if self.sensor_states.get('post_gear_sensor') == False:
                 self.set_status(STATUS_EMPTY)
@@ -791,7 +835,7 @@ class SpoolUnit:
                 self.activate_extruder()
                 speed = self.stepper_helper.unload_speed
                 movepos = self.toolhead.get_position()
-                movepos[3] -= 50.0     # Ideally get toolhead_sensor - end_of_bowden distance
+                movepos[3] -= 100.0     # Ideally get filament_cutter - end_of_bowden distance
                 self.toolhead.move(movepos, speed)
                 self.toolhead.wait_moves()
                 self.hbridge_motor.scheduled_motion(pwm_value=0)
@@ -803,10 +847,27 @@ class SpoolUnit:
                 else:
                     movepos = -2000.0
                 self.stepper_helper.do_set_position(0.)
+                self.hbridge_motor.scheduled_motion(pwm_value=-1.0) # Override interception
                 self.stepper_helper.do_homing_move(movepos=movepos, triggered=False)
                 movepos -= 10.0
                 self.stepper_helper.do_move(movepos)
+                self.hbridge_motor.scheduled_motion(pwm_value=0) # Override interception
                 self.stepper_helper.do_set_position(0.)
+                self.filament_hub.set_loaded_spool_unit(None)
+
+                # Final state verification
+                final_check_failed = []
+                if bool(self.stepper_helper.query_endstop()):
+                    final_check_failed.append("post_gear_sensor")
+                if bool(self.filament_hub.query_hub_endstop()):
+                    final_check_failed.append("hub_sensor")
+                if bool(self.toolhead_sensor.runout_helper.filament_present):
+                    final_check_failed.append("toolhead_sensor")
+
+                if final_check_failed:
+                    raise Exception(f"Final unload checks failed for sensors: {', '.join(final_check_failed)}")
+                
+                logging.info(f'Spool unit {self.name} unloaded successfully.')
                 if self.status != STATUS_CALIBRATING:
                     self.set_status(STATUS_IDLE)
 
@@ -862,6 +923,22 @@ class SpoolUnit:
                 self.toolhead.set_position(self.toolhead.get_position())
                 self.restore_extruder()
                 self.filament_hub.set_loaded_spool_unit(self)
+
+                # Final state verification
+                final_check_failed = []
+                if not bool(self.insert_helper.query_endstop()):
+                    final_check_failed.append("pre_gate_sensor")
+                if not bool(self.stepper_helper.query_endstop()):
+                    final_check_failed.append("post_gear_sensor")
+                if not bool(self.filament_hub.query_hub_endstop()):
+                    final_check_failed.append("hub_sensor")
+                if not bool(self.toolhead_sensor.runout_helper.filament_present):
+                    final_check_failed.append("toolhead_sensor")
+                
+                if final_check_failed:
+                    raise Exception(f"Final load checks failed for sensors: {', '.join(final_check_failed)}")     
+
+                logging.info(f'Spool unit {self.name} loaded successfully.')
                 self.set_status(STATUS_LOADED)
 
             except Exception as e:
@@ -914,6 +991,8 @@ class SpoolUnit:
                 # Check if this toolhead is active
                 if self.toolhead.get_extruder() == self.extruder:   # This toolhead is active
                     self.set_status(STATUS_RUNOUT)
+                    self.gcode.respond_info(f"Runout detected on spool unit {self.name} during printing.\n"
+                                            f"Executing runout gcode and pausing print.")
                     pause_prefix = ""
                     if self.runout_pause:
                         pause_resume = self.printer.lookup_object('pause_resume')
