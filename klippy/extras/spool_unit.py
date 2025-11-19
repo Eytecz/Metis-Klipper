@@ -257,7 +257,11 @@ class LEDHelper:
         led_effect.set_enabled(True)
          
 class SpoolUnit:
+    _instances: list["SpoolUnit"] = []
+    _ready_report_timer = None
+
     def __init__(self, config):
+        SpoolUnit._instances.append(self)
         self.config = config
         self.printer = self.config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -372,6 +376,23 @@ class SpoolUnit:
     def handle_ready(self):
         self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2.0)
 
+        def _report_status(eventtime):
+                lines = ["<b><span style='color: cyan;'>Spool unit initialization states</span></b>"]
+                for spool_unit in sorted(SpoolUnit._instances, key=lambda su: su.name):
+                    status = spool_unit.get_status(eventtime)
+                    lines.append(
+                        f"{spool_unit.name}: <b>{status['status'].upper()}</b>"
+                    )
+                self.gcode.respond_info("\n".join(lines))
+                SpoolUnit._ready_report_timer = None
+                return self.reactor.NEVER
+
+        if SpoolUnit._ready_report_timer is None:
+            waketime = self.reactor.monotonic() + 5.0
+            SpoolUnit._ready_report_timer = self.reactor.register_timer(
+                _report_status, waketime
+            )          
+
     def handle_connect(self):
         self.axis_sync = self.printer.lookup_object('axis_sync')
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -440,22 +461,20 @@ class SpoolUnit:
                     self.reactor.pause(self.reactor.monotonic() + 0.5)
                 self._exec_gcode(pause_prefix, self.exception_gcode)
                 msg = (
-                    f"Exception occurred in {context} for spool unit {self.name}\n"
-                    f"Exception: {str(exception)}\n"
-                    f"Printing has been paused. Please resolve the issue before resuming."
+                    f"<span style='color: #FF4444;'>{str(exception)}</span>\n"
+                    f"<span style='color: #FF4444;'>Printing has been paused. Please resolve the issue before resuming.</span>"
                 )
                 self.gcode.respond_info(msg)
                 logging.info(msg)
                 return self.reactor.NEVER if context == "initializing" else False
         
         msg = (
-            f"Exception occurred in {context} for spool unit {self.name}\n"
-            f"Exception: {str(exception)}\n"
-            f"Printing has not been paused. Please resolve the issue before continuing."
+            f"<span style='color: #FF4444;'>{str(exception)}</span>\n"
+            f"<span style='color: #FF4444;'>Printing has not been paused. Please resolve the issue before continuing.</span>"
         )
         self.gcode.respond_info(msg)
-        logging.info(msg)
-        return self.reactor.NEVER if context == "initializing" else False
+        #logging.info(msg)
+        return self.reactor.NEVER if context == "initializing" else None
 
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
@@ -469,21 +488,48 @@ class SpoolUnit:
         
         # Get spool diameter
         diameter = self.estimate_spool_diameter()
-        diameter_str = f"{diameter} mm" if diameter else "n/a"
+        diameter_str = f"{diameter:.1f}mm" if diameter else "n/a"
         
-        # Format sensor states
-        def fmt(val):
-            return 'triggered' if val else ('open' if val is False else 'n/a')
+        # Get spool content
+        content = self.estimate_spool_content()
+        if content:
+            length_m, mass_g = content
+            content_str = f"{length_m:.1f}m / {mass_g:.0f}g"
+        else:
+            content_str = "n/a"
+        
+        # Format sensor states with color
+        def fmt_sensor(val):
+            if val is True:
+                return "<span style='color: #00FF00;'>triggered</span>"
+            elif val is False:
+                return "<span style='color: #FF0000;'>open</span>"
+            else:
+                return "n/a"
+        
+        # Format enabled/disabled with color
+        def fmt_state(enabled):
+            if enabled:
+                return "<span style='color: #00FF00;'>enabled</span>"
+            else:
+                return "<span style='color: #FF0000;'>disabled</span>"
         
         gcmd.respond_info(
-            f"Spool unit {self.name} query results:\n"
-            f"  Status: {self.status}, synced to extruder: {bool(self.synced)}\n"
+            f"<b><span style='color: cyan;'>Spool unit {self.name} status</span></b>\n"
+            f"  Status: <b>{self.status.upper()}</b>\n"
+            f"  Synced to extruder: {fmt_state(bool(self.synced))}\n"
             f"  Measured spool diameter: {diameter_str}\n"
-            f"  Pre-gate sensor: {fmt(pre_gate)}\n"
-            f"  Post-gear sensor: {fmt(post_gear)}\n"
-            f"  Hub sensor: {fmt(hub)}\n"
-            f"  Toolhead sensor: {fmt(toolhead)}"
+            f"  Estimated spool content: {content_str}\n"
+            f"  Pre-gate sensor: {fmt_sensor(pre_gate)}\n"
+            f"  Post-gear sensor: {fmt_sensor(post_gear)}\n"
+            f"  Hub sensor: {fmt_sensor(hub)}\n"
+            f"  Toolhead sensor: {fmt_sensor(toolhead)}\n"
+            f"  tracking: {fmt_state(self.enable_tracking)}\n"
+            f"  forward_assist: {fmt_state(self.assist_forward)}\n"
+            f"  reverse_assist: {fmt_state(self.assist_reverse)}\n"
+            f"  assist_threshold: {self.assist_threshold:.1f}mm"
         )
+            
 
     def cmd_SPOOL_LOAD(self, gcmd):
         try:
@@ -526,14 +572,13 @@ class SpoolUnit:
             'hub_sensor': bool(self.filament_hub.query_hub_endstop()) if hasattr(self, 'filament_hub') else None,
             'toolhead_sensor': bool(self.toolhead_sensor.runout_helper.filament_present) if hasattr(self, 'toolhead_sensor') else None
         }
-        self.filament_hub.set_loaded_spool_unit(None)
-
+        
         # Catch inconsistent sensor states
         if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == False:
-            e = "Inconsistent sensor states detected during initialization."
+            e = f"Inconsistent sensor states detected during initialization for spool unit {self.name}."
             return self.handle_exception(e, "initializing", False)
         elif self.sensor_states.get('hub_sensor') == False and self.sensor_states.get('toolhead_sensor') == True:
-            e = "Inconsistent sensor states detected during initialization."
+            e = f"Inconsistent sensor states detected during initialization for spool unit {self.name}."
             return self.handle_exception(e, "initializing", False)
         
         # Determine status based on sensor states
@@ -555,12 +600,30 @@ class SpoolUnit:
                     return self.handle_exception(e, "initializing", pause_on_error=False) 
             else:
                 if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == True:
-                    self.filament_hub.set_loaded_spool_unit(self)
-                    self.sync_to_extruder(True)
-                    self.set_status(STATUS_LOADED)
+                    try:
+                        loaded_spool = self.filament_hub.get_loaded_spool_unit()
+                        if loaded_spool is not None and loaded_spool is not self:
+                            # Delayed start required to allow other spool unit to finish initialization first
+                            def error_timer(eventtime):
+                                e = (
+                                f"Cannot initialize spool unit {self.name} and {loaded_spool.name}, sensor conflict detected.\n"
+                                f"Manual intervention required to resolve conflict."
+                                )
+                                self.gcode.respond_info(e)
+                                self.filament_hub.set_loaded_spool_unit(None)
+                                self.set_status(STATUS_ERROR)
+                                loaded_spool.set_status(STATUS_ERROR)
+                                return self.reactor.NEVER
+                            self.reactor.register_timer(error_timer, self.reactor.monotonic() + 2.0)
+                        elif loaded_spool is None:
+                            self.filament_hub.set_loaded_spool_unit(self)
+                            self.sync_to_extruder(True)
+                            self.set_status(STATUS_LOADED)
+                    except Exception as e:
+                        return self.handle_exception(e, "initializing", pause_on_error=False)
                 else:
                     self.set_status(STATUS_ERROR)
-        logging.info(f'Spool unit {self.name} status determined as: {self.status}')
+        #self.gcode.respond_info(f'Spool unit {self.name} intialized with status: {self.status}')
         return self.reactor.NEVER        
 
     
@@ -878,13 +941,15 @@ class SpoolUnit:
             return self.handle_exception(e, "spool_unload", pause_on_error=True)
     
     def spool_load(self):
+        # Check if already loaded
+        loaded_spool = self.filament_hub.get_loaded_spool_unit()
+        if loaded_spool is self:
+            return
+        # Unload if another spool is loaded
+        elif loaded_spool is not None:
+            loaded_spool.spool_unload()
+        
         if self.status == STATUS_IDLE:
-            # Check shared hub sensor state and unload if required
-            loaded_spool = self.filament_hub.get_loaded_spool_unit()
-            if loaded_spool is self:
-                return
-            elif loaded_spool is not None:
-                loaded_spool.spool_unload()
             # Load filament to toolhead
             try:
                 self.set_status(STATUS_LOADING)
@@ -1174,14 +1239,14 @@ class SpoolUnit:
         if diameter is None:
             gcmd.error("Failed to measure spool diameter - sensor error or no spool detected")
         else:
-            gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f} mm")
+            gcmd.respond_info(f"Estimated spool diameter: {diameter:.2f}mm")
 
     def cmd_ESTIMATE_SPOOL_CONTENT(self, gcmd):
         # Parse optional parameters
-        density = gcmd.get_float('DENSITY', self.material_density, minval=0.1)
-        width = gcmd.get_float('WIDTH', self.spool_width, minval=1.0)
-        filament_dia = gcmd.get_float('FILAMENT_DIAMETER', self.filament_diameter, minval=0.1)
-        packing_eff = gcmd.get_float('PACKING_EFFICIENCY', self.packing_efficiency, minval=0.5, maxval=1.0)
+        density = gcmd.get_float('rho', self.material_density, minval=0.1)
+        width = gcmd.get_float('w', self.spool_width, minval=1.0)
+        filament_dia = gcmd.get_float('d', self.filament_diameter, minval=0.1)
+        packing_eff = gcmd.get_float('eta', self.packing_efficiency, minval=0.5, maxval=1.0)
         
         content = self.estimate_spool_content(density, width, filament_dia, packing_eff)
         
@@ -1190,11 +1255,11 @@ class SpoolUnit:
             return
         
         length_m, mass_g = content
-        gcmd.respond_info(f"Estimated spool content:")
-        gcmd.respond_info(f"  Filament length: {length_m:.2f} meters")
-        gcmd.respond_info(f"  Filament mass: {mass_g:.1f} grams")
-        gcmd.respond_info(f"  Parameters used: density={density:.2f}g/cm³, width={width:.1f}mm, filament_dia={filament_dia:.2f}mm, packing_eff={packing_eff:.2f}")
-
+        gcmd.respond_info(
+            f"Estimated spool content: {length_m:.2f}m / {mass_g:.1f}g\n"
+            f"Parameters: D={self.estimate_spool_diameter():.2f}mm, w={width:.1f}mm, d={filament_dia:.2f}mm, rho={density:.2f}g/cm³,  eta={packing_eff:.2f}"
+            )
+    
     def get_name(self):
         return self.name
 
