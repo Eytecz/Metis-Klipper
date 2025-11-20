@@ -377,18 +377,20 @@ class SpoolUnit:
         self.reactor.register_timer(self.initialize_spool_unit, self.reactor.monotonic() + 2.0)
 
         def _report_status(eventtime):
-                lines = ["<b><span style='color: cyan;'>Spool unit initialization states</span></b>"]
+                states = []
                 for spool_unit in sorted(SpoolUnit._instances, key=lambda su: su.name):
                     status = spool_unit.get_status(eventtime)
-                    lines.append(
+                    states.append(
                         f"{spool_unit.name}: <b>{status['status'].upper()}</b>"
                     )
-                self.gcode.respond_info("\n".join(lines))
+                header = "<b><span style='color: #FF4444;'>Spool unit states</span></b>"
+                body = ", ".join(states)
+                self.gcode.respond_info(f"{header}\n{body}")
                 SpoolUnit._ready_report_timer = None
                 return self.reactor.NEVER
 
         if SpoolUnit._ready_report_timer is None:
-            waketime = self.reactor.monotonic() + 5.0
+            waketime = self.reactor.monotonic() + 6.0
             SpoolUnit._ready_report_timer = self.reactor.register_timer(
                 _report_status, waketime
             )          
@@ -515,7 +517,7 @@ class SpoolUnit:
                 return "<span style='color: #FF0000;'>disabled</span>"
         
         gcmd.respond_info(
-            f"<b><span style='color: cyan;'>Spool unit {self.name} status</span></b>\n"
+            f"<b><span style='color: #FF4444;'>Query results for spool unit {self.name}</span></b>\n"
             f"  Status: <b>{self.status.upper()}</b>\n"
             f"  Synced to extruder: {fmt_state(bool(self.synced))}\n"
             f"  Measured spool diameter: {diameter_str}\n"
