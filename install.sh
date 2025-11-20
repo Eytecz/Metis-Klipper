@@ -3,9 +3,9 @@ set -eu
 export LC_ALL=C
 
 KLIPPER_PATH="${HOME}/klipper"
-INSTALL_PATH="${1:-${HOME}/archetype-klipper}"
-REPO_URL="https://github.com/Eytecz/Archetype-Klipper.git"
-REPO_NAME="Archetype-Klipper"
+INSTALL_PATH="${1:-${HOME}/metis-klipper}"
+REPO_URL="https://github.com/Eytecz/Metis-Klipper.git"
+REPO_NAME="Metis-Klipper"
 
 MOONRAKER_CONF="${HOME}/printer_data/config/moonraker.conf"
 
