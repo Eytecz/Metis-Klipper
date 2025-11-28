@@ -4,10 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license
 
-import math
-import time
 import logging
-import threading
 
 class Liftbar:
     def __init__(self, config):

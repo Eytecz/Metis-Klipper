@@ -5,8 +5,6 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import math
-import logging
-import string
 
 class PurgeBelt:
     def __init__(self, config):
@@ -53,6 +51,7 @@ class PurgeBelt:
         # Internal state
         self.sync_status = False
         self.purge_belt_stepper = None
+        self.last_purge_belt_rotation_distance = None
 
     def handle_ready(self):
         self.min_event_systime = self.reactor.monotonic()
@@ -107,7 +106,8 @@ class PurgeBelt:
             axis_sync = self.printer.lookup_object('axis_sync')
             stepper_name = f'manual_stepper {self.stepper_name}'
             axis_sync.sync_stepper_to_extruder(stepper_name, extruder_name=None)
-            self.purge_belt_stepper.get_steppers()[0].set_rotation_distance(self.last_purge_belt_rotation_distance)
+            if self.last_purge_belt_rotation_distance:
+                self.purge_belt_stepper.get_steppers()[0].set_rotation_distance(self.last_purge_belt_rotation_distance)
             self.sync_status = False
 
     def get_init_toolhead_pos(self):
