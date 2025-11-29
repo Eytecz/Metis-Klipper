@@ -21,6 +21,47 @@ class AxisSync:
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
 
+    def sync_stepper_to_manual_stepper(self, stepper_name, manual_stepper_name=None):
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        motion_queuing = self.printer.lookup_object('motion_queuing')
+        
+        # Get manual stepper
+        stepper = self.printer.lookup_object(stepper_name, None)
+        if stepper is None or stepper.__class__.__name__ != 'ManualStepper':
+            raise self.printer.command_error("'%s' is not a manual stepper" % stepper_name)
+        
+        # Unsync if no manual stepper specified
+        if not manual_stepper_name:
+            orig_trapq = getattr(stepper, '_sync_orig_trapq', None)
+            stepper.rail.set_trapq(orig_trapq)
+            if hasattr(stepper, '_sync_orig_trapq'):
+                delattr(stepper, '_sync_orig_trapq')
+            
+            # Restore original position
+            if hasattr(stepper, '_sync_orig_position'):
+                orig_pos = stepper._sync_orig_position
+                stepper.do_set_position(orig_pos)
+                delattr(stepper, '_sync_orig_position')
+            
+            motion_queuing.check_step_generation_scan_windows()
+            return
+        
+        # Get manual stepper to sync to
+        manual_stepper = self.printer.lookup_object(manual_stepper_name, None)
+        if manual_stepper is None or manual_stepper.__class__.__name__ != 'ManualStepper':
+            raise self.printer.command_error("'%s' is not a manual stepper" % manual_stepper_name)
+        
+        # Store original trapq and position
+        if not hasattr(stepper, '_sync_orig_trapq'):
+            stepper._sync_orig_trapq = stepper.get_trapq()
+        if not hasattr(stepper, '_sync_orig_position'):
+            stepper._sync_orig_position = stepper.get_position()[0]
+        
+        stepper.do_set_position(manual_stepper.get_position()[0])
+        stepper.rail.set_trapq(manual_stepper.get_trapq())
+        motion_queuing.check_step_generation_scan_windows()
+
     def sync_stepper_to_extruder(self, stepper_name, extruder_name=None):
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
@@ -75,6 +116,20 @@ class AxisSync:
                 gcmd.respond_info("Stepper '%s' unsynced" % stepper)
         except Exception as e:
             raise self.gcode.error("SYNC_EXTRUDER_STEPPER error: %s" % str(e))
+        
+    cmd_SYNC_MANUAL_STEPPER_help = "Sync manual stepper with another manual stepper"
+    def cmd_SYNC_MANUAL_STEPPER(self, gcmd):
+        stepper = gcmd.get('STEPPER')
+        manual_stepper = gcmd.get('MANUAL_STEPPER', None)
+        
+        try:
+            self.sync_stepper_to_manual_stepper(stepper, manual_stepper)
+            if manual_stepper:
+                gcmd.respond_info("Stepper '%s' synced to '%s'" % (stepper, manual_stepper))
+            else:
+                gcmd.respond_info("Stepper '%s' unsynced" % stepper)
+        except Exception as e:
+            raise self.gcode.error("SYNC_MANUAL_STEPPER error: %s" % str(e))
 
 def load_config(config):
     return AxisSync(config)
