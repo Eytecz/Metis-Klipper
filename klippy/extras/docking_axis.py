@@ -13,6 +13,7 @@ class StepperHelper:
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("stepper_enable:motor_off", self.stepper_enable_motor_off)
 
         # Read config section
         self.stepper_names = config.getlist('steppers', ['stepper_a', 'stepper_b'])
@@ -22,10 +23,12 @@ class StepperHelper:
         self.pos_min = config.getfloat('position_min', 38.)
         self.pos_max = config.getfloat('position_max', 450.)
         self.pos_endstop = config.getfloat('position_endstop', 38.)
+        self.pos_park = config.getfloat('position_park', 400.)
 
         # Internal state
         self.commanded_pos = 0.
-    
+        self.homed = False
+
     def handle_connect(self):
         self.axis_sync = self.printer.lookup_object('axis_sync')
         stepper_objects = {}
@@ -40,7 +43,15 @@ class StepperHelper:
                 self.steppers.append(stepper_objects[name])
             else:
                 raise self.config.error("Could not find stepper '%s'" % name)
-    
+
+    def stepper_enable_motor_off(self):
+        se = self.printer.lookup_object('stepper_enable')
+        for s in self.steppers:
+            name = s.get_steppers()[0].get_name()
+            state = se.lookup_enable(name).is_enabled
+            if not state:
+                self.homed = False
+
     def do_enable(self, enable):
         for s in self.steppers:
             s.do_enable(enable)
@@ -51,6 +62,8 @@ class StepperHelper:
         self.commanded_pos = setpos
     
     def do_move(self, movepos, speed, accel, sync=True):
+        if not self.homed:
+            raise self.printer.command_error("Must home docking axis before move")
         # Check if move is in bounds
         if movepos < self.pos_endstop or movepos > self.pos_max:
             raise self.printer.command_error("Move to %.3f out of bounds (min: %.3f, max: %.3f)"
@@ -105,6 +118,7 @@ class StepperHelper:
             toolhead = self.printer.lookup_object('toolhead')
             toolhead.wait_moves()
             self.commanded_pos = self.pos_endstop
+            self.homed = True
 
         except Exception as e:
             for s in self.steppers[1:]:
@@ -193,6 +207,12 @@ class DockingAxis:
                 raise gcmd.error("Move out of range")
             sync = gcmd.get_int('SYNC', 1)
             self.stepper.do_move(movepos, speed, accel, sync)
+        
+    def get_status(self, eventtime):
+        return {
+            'position': self.stepper.get_position(),
+            'homed': bool(self.stepper.homed)
+        }
 
 
 def load_config(config):
