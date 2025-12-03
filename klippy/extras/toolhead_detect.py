@@ -14,6 +14,16 @@ class ToolheadDetect:
         # Read config
         self.name = config.get_name().split()[1]
         pin = config.get('pin')
+        self.debounce_time = config.getfloat('debounce_time', 0.5, minval=0.)
+        self.lost_timeout = config.getfloat('lost_timeout', 5.0, minval=0.)
+        self.pause_on_lost = config.getboolean('pause_on_lost', True)
+        self.extruder_name = config.get('extruder', 'extruder')
+        self.state_logging = config.getboolean('state_logging', True)
+        
+        gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        self.lost_gcode = None
+        if self.pause_on_lost or config.get('lost_gcode', None) is not None:
+            self.lost_gcode = gcode_macro.load_template(config, 'lost_gcode', '')
 
         # Initial state
         self.toolhead_present = False
@@ -21,10 +31,6 @@ class ToolheadDetect:
         self.pending_state = None
         self.confirm_timer = None
         self.lost_timer = None
-        self.debounce_time = config.getfloat('debounce_time', 0.5, minval=0.)
-        self.lost_timeout = config.getfloat('lost_timeout', 5.0, minval=0.)
-        self.pause_on_lost = config.getboolean('pause_on_lost', True)
-        self.extruder_name = config.get('extruder', 'extruder')
 
         # Register required objects
         buttons = self.printer.load_object(config, 'buttons')
@@ -50,20 +56,24 @@ class ToolheadDetect:
             if self.confirm_timer:
                 self.reactor.unregister_timer(self.confirm_timer)
                 self.confirm_timer = None
-            logging.info("Toolhead state bounced, ignoring")
+            if self.state_logging:
+                logging.info(f"Toolhead {self.name} state bounced, ignoring")
         
         def _confirm_state_change(eventtime):
             if self.pending_state == state:
                 self.pending_state = None
                 if self.toolhead_present == state:
-                    logging.info("Toolhead state unchanged after confirmation")
+                    if self.state_logging:
+                        logging.info(f"Toolhead {self.name} state unchanged after confirmation")
                     return self.reactor.NEVER
                 self.toolhead_present = state
                 if self.toolhead_present:
-                    logging.info("Toolhead engaged confirmed")
+                    if self.state_logging:
+                        logging.info(f"Toolhead {self.name} engaged confirmed")
                     self._engage_event_handler()
                 else:
-                    logging.info("Toolhead disengaged confirmed")
+                    if self.state_logging:
+                        logging.info(f"Toolhead {self.name} disengaged confirmed")
                     self._disengage_event_handler()
             self.confirm_timer = None
             return self.reactor.NEVER
@@ -73,24 +83,70 @@ class ToolheadDetect:
         self.confirm_timer = self.reactor.register_timer(
             _confirm_state_change, self.reactor.monotonic() + self.debounce_time
         )
-        logging.info("Toolhead state change detected, confirming...")
+        if self.state_logging:
+            logging.info(f"Toolhead {self.name} state change detected, confirming...")
 
     def _engage_event_handler(self):
-        pass
+        # Cancel lost timer if running
+        if self.lost_timer is not None:
+            self.reactor.unregister_timer(self.lost_timer)
+            self.lost_timer = None
+            if self.state_logging:
+                logging.info(f"Toolhead {self.name} re-engaged, cancelling lost timer")
 
     def _disengage_event_handler(self):
-        if self.pause_on_lost:
+        if self.pause_on_lost or self.lost_gcode is not None:
+            # Check printer state, return if not printing
+            idle_timeout = self.printer.lookup_object('idle_timeout')
+            is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
+            if not is_printing:
+                if self.state_logging:
+                    logging.info(f"Not pausing print due to toolhead {self.name} disengagement (not printing)")
+                return
+
+            # Verify active extruder is this toolhead
             toolhead = self.printer.lookup_object('toolhead')
             active_extruder = toolhead.get_extruder().get_name()
-            if active_extruder == self.extruder_name:
-                logging.info("Pausing print due to toolhead disengagement")
-                # Add more code here
+            if active_extruder != self.extruder_name:
+                if self.state_logging:
+                    logging.info(f"Not pausing print due to toolhead {self.name} disengagement (active extruder is {active_extruder})")
+                return
+            
+            # Define pause print callback
+            def _pause_print(eventtime):
+                logging.info(f"Toolhead {self.name} lost timeout reached, executing lost gcode and/or pausing...")
+                self.lost_timer = None
+                pause_prefix = ""
+                if self.pause_on_lost:
+                    pause_resume = self.printer.lookup_object('pause_resume')
+                    pause_resume.send_pause_command()
+                    pause_prefix = "PAUSE\n"
+                    self.reactor.pause(eventtime + 0.5)
+                self._exec_gcode(pause_prefix, self.lost_gcode)
+                return self.reactor.NEVER
+            
+            # Check for existing lost timer
+            if self.lost_timer is not None:
+                self.reactor.unregister_timer(self.lost_timer)
+                self.lost_timer = None
 
+            # Start lost timer
+            self.lost_timer = self.reactor.register_timer(
+                _pause_print, self.reactor.monotonic() + self.lost_timeout
+            )
+            if self.state_logging:
+                logging.info(f"Toolhead {self.name} disengaged, starting lost timer...")
+
+    def _exec_gcode(self, prefix, template):
+        try:
+            self.gcode.run_script(prefix + template.render() + "\nM400")
+        except Exception as e:
+            raise self.printer.command_error(f"Failed to execute toolhead {self.name} pause_on_lost gcode: {str(e)}")
     
     def cmd_QUERY_TOOLHEAD_ENGAGEMENT(self, gcmd):
         try:
             state = self.query_state_blocking()
-            gcmd.respond_info("Toolhead engaged: %s" % state)
+            gcmd.respond_info(f"Toolhead {self.name} engaged: {state}")
         except Exception as e:
             raise self.printer.command_error(str(e))
 
@@ -108,7 +164,7 @@ class ToolheadDetect:
         while self.pending_state is not None:
             curtime = self.reactor.monotonic()
             if curtime > endtime:
-                raise Exception("Timeout waiting for toolhead state confirmation")
+                raise Exception(f"Timeout waiting for toolhead {self.name} state confirmation")
             self.reactor.pause(curtime + 0.05)
 
         return bool(self.toolhead_present)
