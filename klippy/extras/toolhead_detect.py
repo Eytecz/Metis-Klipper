@@ -175,6 +175,9 @@ class ToolheadDetect:
     def get_name(self):
         return self.name
 
+    def get_extruder_name(self):
+        return self.extruder_name
+
     def get_status(self, eventtime):
         return {
             'toolhead_engaged': bool(self.toolhead_present),
