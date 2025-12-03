@@ -625,7 +625,6 @@ class SpoolUnit:
                         return self.handle_exception(e, "initializing", pause_on_error=False)
                 else:
                     self.set_status(STATUS_ERROR)
-        #self.gcode.respond_info(f'Spool unit {self.name} intialized with status: {self.status}')
         return self.reactor.NEVER        
 
     

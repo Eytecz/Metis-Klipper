@@ -136,52 +136,16 @@ class DockingAxis:
         self.config = config
         self.printer= config.get_printer()
 
+        # Register required objects
         self.stepper = StepperHelper(config)
 
         # Register g-code commands
         self.gcode = self.printer.lookup_object('gcode')
-        self.gcode.register_command('RUN', self.cmd_RUN,
-                                    desc = "Execute a method command within Python context")
         self.gcode.register_command('DOCKING_AXIS', self.cmd_DOCKING_AXIS,
                                     desc = "Command the docking axis module")
-        
-    def cmd_RUN(self, gcmd):
-        method_name = gcmd.get('METHOD')
-        
-        # Get the method from stepper helper
-        if not hasattr(self.stepper, method_name):
-            raise gcmd.error(f"Method '{method_name}' not found in StepperHelper")
-        
-        method = getattr(self.stepper, method_name)
-        
-        # Parse arguments - convert strings to appropriate types
-        kwargs = {}
-        for param in gcmd.get_command_parameters():
-            if param in ['METHOD']:  # Skip the method name itself
-                continue
-            value = gcmd.get(param)
-            param_lower = param.lower()
-            
-            # Try to convert to appropriate type
-            try:
-                if value.lower() in ['true', '1']:
-                    kwargs[param_lower] = True
-                elif value.lower() in ['false', '0']:
-                    kwargs[param_lower] = False
-                else:
-                    # Try float conversion
-                    kwargs[param_lower] = gcmd.get_float(param)
-            except:
-                # Keep as string if conversion fails
-                kwargs[param_lower] = value
-        
-        # Call the method
-        try:
-            method(**kwargs)
-            gcmd.respond_info(f"Executed {method_name} with args: {kwargs}")
-        except Exception as e:
-            raise gcmd.error(f"Error executing {method_name}: {str(e)}")
-
+        self.gcode.register_command('DOCKING_AXIS_POSITION', self.cmd_DOCKING_AXIS_POSITION,
+                                    desc = "Get the current docking axis position")
+    
     def cmd_DOCKING_AXIS(self, gcmd):
         enable = gcmd.get_int('ENABLE', None)
         if enable is not None:
@@ -207,13 +171,19 @@ class DockingAxis:
                 raise gcmd.error("Move out of range")
             sync = gcmd.get_int('SYNC', 1)
             self.stepper.do_move(movepos, speed, accel, sync)
-        
+
+    def cmd_DOCKING_AXIS_POSITION(self, gcmd):
+        pos = self.stepper.get_position()
+        gcmd.respond_info("Docking axis position: %.3f" % pos)
+    
+    def get_position(self):
+        return self.stepper.get_position()
+
     def get_status(self, eventtime):
         return {
             'position': self.stepper.get_position(),
             'homed': bool(self.stepper.homed)
         }
-
 
 def load_config(config):
     return DockingAxis(config)
