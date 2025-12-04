@@ -7,6 +7,13 @@
 
 import logging
 
+# Docking axis behaviour options
+axis_modes = {
+    'static': 'static',         # No docking axis movement
+    'balanced': 'balanced',     # Split motion, docking axis and z-axis meet halfway
+    'minimize_z': 'minimize_z', # Minimize z-axis movement, docking axis does most of the work
+}
+
 class Dock:
     def __init__(self, config):
         self.config = config
@@ -15,8 +22,14 @@ class Dock:
         # Read config section
         self.name = config.get_name().split()[1]
         self.extruder_name = config.get('extruder', 'extruder')
-        self.docking_axis = config.getboolean('docking_axis', False)
         self.toolhead_detect = config.getboolean('toolhead_detect', False)
+
+        self.docking_axis = config.getboolean('docking_axis', False)
+        if self.docking_axis:
+            self.axis_mode = config.getchoice(
+                'axis_mode', axis_modes, 'balanced')
+        else:
+            self.axis_mode = axis_modes['static']
 
         self.docking_speed = config.getfloat('docking_speed', 20., above=0.)
         self.engage_speed = config.getfloat('engage_speed', 10., above=0.)
@@ -60,7 +73,7 @@ class Dock:
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
 
-        # Register reuired objects
+        # Register required objects
         self.gcode = self.printer.lookup_object('gcode')
 
         # Register g-code commands
@@ -78,6 +91,10 @@ class Dock:
             if self.toolhead_detect is None:
                 raise self.config.error("Missing required toolhead_detect object")
         
-    
+    def cut_filament(self):
+        if not self.filament_cutter:
+            raise self.printer.command_error(f"Filament cutter not configured for dock {self.name}")
+
+
 def load_config_prefix(config):
     return Dock(config)
