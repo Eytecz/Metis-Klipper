@@ -31,6 +31,7 @@ class ToolheadDetect:
         self.pending_state = None
         self.confirm_timer = None
         self.lost_timer = None
+        self.enabled = False
 
         # Register required objects
         buttons = self.printer.load_object(config, 'buttons')
@@ -42,6 +43,9 @@ class ToolheadDetect:
         self.gcode.register_mux_command('QUERY_TOOLHEAD_ENGAGEMENT', 'TOOLHEAD', self.name,
                                         self.cmd_QUERY_TOOLHEAD_ENGAGEMENT,
                                         desc="Query toolhead engagement state")
+        self.gcode.register_mux_command('ENABLE_TOOLHEAD_DETECT', 'TOOLHEAD', self.name,
+                                        self.cmd_ENABLE_TOOLHEAD_DETECT,
+                                        desc="Enable toolhead engagement detection")
 
     def handle_ready(self):
         pass
@@ -87,6 +91,8 @@ class ToolheadDetect:
             logging.info(f"Toolhead {self.name} state change detected, confirming...")
 
     def _engage_event_handler(self):
+        if not self.enabled:
+            return
         # Cancel lost timer if running
         if self.lost_timer is not None:
             self.reactor.unregister_timer(self.lost_timer)
@@ -95,6 +101,8 @@ class ToolheadDetect:
                 logging.info(f"Toolhead {self.name} re-engaged, cancelling lost timer")
 
     def _disengage_event_handler(self):
+        if not self.enabled:
+            return
         if self.pause_on_lost or self.lost_gcode is not None:
             # Check printer state, return if not printing
             idle_timeout = self.printer.lookup_object('idle_timeout')
@@ -149,6 +157,18 @@ class ToolheadDetect:
             gcmd.respond_info(f"Toolhead {self.name} engaged: {state}")
         except Exception as e:
             raise self.printer.command_error(str(e))
+        
+    def cmd_ENABLE_TOOLHEAD_DETECT(self, gcmd):
+        state = bool(gcmd.get_int('STATE', 1))
+        self.enable(state)
+        gcmd.respond_info(f"Toolhead {self.name} detection {'enabled' if state else 'disabled'}")
+
+    def enable(self, state=True):
+        if self.enabled == state:
+            return
+        self.enabled = state
+        if self.state_logging:
+            logging.info(f"Toolhead {self.name} detection {'enabled' if state else 'disabled'}")
 
     def query_state(self):
         return self.toolhead_present
@@ -182,6 +202,7 @@ class ToolheadDetect:
         return {
             'toolhead_engaged': bool(self.toolhead_present),
             'toolhead_pending_state': bool(self.pending_state is not None),
+            'toolhead_detect_enabled': bool(self.enabled),
         }        
 
 def load_config_prefix(config):

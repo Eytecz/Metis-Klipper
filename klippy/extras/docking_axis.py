@@ -179,7 +179,7 @@ class DockingAxis:
     def get_position(self):
         return self.stepper.get_position()
 
-    def get_status(self, eventtime):
+    def get_status(self, eventtime=None):
         return {
             'position': self.stepper.get_position(),
             'homed': bool(self.stepper.homed)
