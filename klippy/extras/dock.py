@@ -6,7 +6,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import logging
-import math
+from extras import tmc2130, tmc2240, tmc2660, tmc5160
 
 # Docking axis behaviour options
 axis_modes = {
@@ -15,90 +15,48 @@ axis_modes = {
     'minimize_z': 'minimize_z', # Minimize z-axis movement, docking axis does most of the work
 }
 
-MAX_CURRENT = 2.000
-
 class TMCCurrentHelper:
     def __init__(self, config):
         self.config = config
         self.printer= config.get_printer()
-        
-        # Initial state
-        self.tmc_drivers = {}
-
-        # Register event handlers
+        self.tmc_helpers = {}
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
     
     def handle_connect(self):
+        tmc_modules = {
+            'tmc2130': tmc2130.TMCCurrentHelper,
+            'tmc2208': tmc2130.TMCCurrentHelper,
+            'tmc2209': tmc2130.TMCCurrentHelper,
+            'tmc2240': tmc2240.TMC2240CurrentHelper,
+            'tmc2660': tmc2660.TMC2660CurrentHelper,
+            'tmc5160': tmc5160.TMC5160CurrentHelper,
+        }
+
         for name, obj in self.printer.lookup_objects():
             if name.startswith('tmc'):
-                logging.info(f"Found TMC driver object: {name}")
                 stepper_name = name.split()[1] if len(name.split()) > 1 else None
-                if stepper_name and (stepper_name.startswith('stepper_x') or 
-                                    stepper_name.startswith('stepper_y')):
-                    self.tmc_drivers[stepper_name] = {
-                        'object': obj,
-                        'fields': obj.fields,
-                        'mcu_tmc': obj.mcu_tmc,
-                        'sense_resistor': self.config.getsection(name).getfloat('sense_resistor', 0.110, above=0.),
-                        'req_hold_current': self.config.getsection(name).getfloat('hold_current', MAX_CURRENT, above=0., maxval=MAX_CURRENT),
-                    }
-        if 'stepper_x' not in self.tmc_drivers or 'stepper_y' not in self.tmc_drivers:
-            raise self.config.error(
-                "Missing required tmc drivers for stepper_x and stepper_y to set cutting current")
+                if stepper_name and (stepper_name.startswith('stepper_x') or
+                                     stepper_name.startswith('stepper_y')):
+                    tmc_type = name.split()[0]
+                    if tmc_type in tmc_modules:
+                        section = self.config.getsection(name)
+                        current_helper = tmc_modules[tmc_type](section, obj.mcu_tmc)
+                        self.tmc_helpers[stepper_name] = current_helper
+        if 'stepper_x' not in self.tmc_helpers and 'stepper_y' not in self.tmc_helpers:
+            raise self.config.error("No TMC stepper drivers found for X or Y axes")
+
+    def get_current(self, stepper_name):
+        if stepper_name in self.tmc_helpers:
+            return self.tmc_helpers[stepper_name].get_current()
+        else:
+            raise self.config.error(f"No TMC current helper found for stepper '{stepper_name}'")
     
-    def _calc_current_bits(self, current, vsense, name):
-        sense_resistor = self.tmc_drivers[name]['sense_resistor'] + 0.020
-        vref = 0.32
-        if vsense:
-            vref = 0.18
-        cs = int(32. * sense_resistor * current * math.sqrt(2.) / vref + .5) - 1
-        return max(0, min(31, cs))
-
-    def _calc_current_from_bits(self, cs, vsense, name):
-        sense_resistor = self.tmc_drivers[name]['sense_resistor'] + 0.020
-        vref = 0.32
-        if vsense:
-            vref = 0.18
-        return (cs + 1) * vref / (32. * sense_resistor * math.sqrt(2.))
-        
-    def _calc_current(self, run_current, hold_current, name):
-        vsense = True
-        irun = self._calc_current_bits(run_current, True, name)
-        if irun == 31:
-            cur = self._calc_current_from_bits(irun, True, name)
-            if cur < run_current:
-                irun2 = self._calc_current_bits(run_current, False, name)
-                cur2 = self._calc_current_from_bits(irun2, False, name)
-                if abs(run_current - cur2) < abs(run_current - cur):
-                    vsense = False
-                    irun = irun2
-        ihold = self._calc_current_bits(min(hold_current, run_current), vsense, name)
-        return vsense, irun, ihold
-
-    def get_current(self, name):
-        driver = self.tmc_drivers.get(name, None)
-        if driver is None:
-            raise self.printer.command_error(f"Requested TMC driver '{name}' not found")
-        irun = driver['fields'].get_field('irun')
-        ihold = driver['fields'].get_field('ihold')
-        vsense = driver['fields'].get_field("vsense")
-        run_current = self._calc_current_from_bits(irun, vsense, name)
-        hold_current = self._calc_current_from_bits(ihold, vsense, name)
-        req_hold_current = driver['req_hold_current']
-        return run_current, hold_current, req_hold_current, MAX_CURRENT
-
-    def set_current(self, run_current, hold_current, print_time, name):
-        driver = self.tmc_drivers.get(name, None)
-        if driver is None:
-            raise self.printer.command_error(f"Requested TMC driver '{name}' not found")
-        driver['req_hold_current'] = hold_current
-        vsense, irun, ihold = self._calc_current(run_current, hold_current, name)
-        if vsense != driver['fields'].get_field("vsense"):
-            val = driver['fields'].set_field("vsense", vsense)
-            driver['mcu_tmc'].set_register("CHOPCONF", val, print_time)
-        driver['fields'].set_field("ihold", ihold)
-        val = driver['fields'].set_field("irun", irun)
-        driver['mcu_tmc'].set_register("IHOLD_IRUN", val, print_time)
+    def set_current(self, run_current, hold_current, print_time, stepper_name):
+        if stepper_name in self.tmc_helpers:
+            self.tmc_helpers[stepper_name].set_current(
+                run_current, hold_current, print_time)
+        else:
+            raise self.config.error(f"No TMC current helper found for stepper '{stepper_name}'")
 
 class Dock:
     def __init__(self, config):
@@ -300,7 +258,7 @@ class Dock:
             # Raise tmc driver currents
             if self.cutting_current is not None:
                 self.prev_currents = {}
-                for name, driver in self.current_helper.tmc_drivers.items():
+                for name, _ in self.current_helper.tmc_helpers.items():
                     run_current, hold_current, _, max_current = self.current_helper.get_current(name)
                     self.prev_currents[name] = (run_current, hold_current)
                     if self.cutting_current > run_current:
@@ -315,7 +273,7 @@ class Dock:
 
             # Restore tmc driver currents
             if self.prev_currents is not None:
-                for name, _ in self.current_helper.tmc_drivers.items():
+                for name, _ in self.current_helper.tmc_helpers.items():
                     if name in self.prev_currents:
                         run_current, hold_current = self.prev_currents[name]
                         print_time = self.toolhead.get_last_move_time()
