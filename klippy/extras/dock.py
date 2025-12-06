@@ -6,6 +6,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import logging
+import math
 
 # Docking axis behaviour options
 axis_modes = {
@@ -13,6 +14,91 @@ axis_modes = {
     'balanced': 'balanced',     # Split motion, docking axis and z-axis meet halfway
     'minimize_z': 'minimize_z', # Minimize z-axis movement, docking axis does most of the work
 }
+
+MAX_CURRENT = 2.000
+
+class TMCCurrentHelper:
+    def __init__(self, config):
+        self.config = config
+        self.printer= config.get_printer()
+        
+        # Initial state
+        self.tmc_drivers = {}
+
+        # Register event handlers
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+    
+    def handle_connect(self):
+        for name, obj in self.printer.lookup_objects():
+            if name.startswith('tmc'):
+                logging.info(f"Found TMC driver object: {name}")
+                stepper_name = name.split()[1] if len(name.split()) > 1 else None
+                if stepper_name and (stepper_name.startswith('stepper_x') or 
+                                    stepper_name.startswith('stepper_y')):
+                    self.tmc_drivers[stepper_name] = {
+                        'object': obj,
+                        'fields': obj.fields,
+                        'mcu_tmc': obj.mcu_tmc,
+                        'sense_resistor': self.config.getsection(name).getfloat('sense_resistor', 0.110, above=0.),
+                        'req_hold_current': self.config.getsection(name).getfloat('hold_current', MAX_CURRENT, above=0., maxval=MAX_CURRENT),
+                    }
+        if 'stepper_x' not in self.tmc_drivers or 'stepper_y' not in self.tmc_drivers:
+            raise self.config.error(
+                "Missing required tmc drivers for stepper_x and stepper_y to set cutting current")
+    
+    def _calc_current_bits(self, current, vsense, name):
+        sense_resistor = self.tmc_drivers[name]['sense_resistor'] + 0.020
+        vref = 0.32
+        if vsense:
+            vref = 0.18
+        cs = int(32. * sense_resistor * current * math.sqrt(2.) / vref + .5) - 1
+        return max(0, min(31, cs))
+
+    def _calc_current_from_bits(self, cs, vsense, name):
+        sense_resistor = self.tmc_drivers[name]['sense_resistor'] + 0.020
+        vref = 0.32
+        if vsense:
+            vref = 0.18
+        return (cs + 1) * vref / (32. * sense_resistor * math.sqrt(2.))
+        
+    def _calc_current(self, run_current, hold_current, name):
+        vsense = True
+        irun = self._calc_current_bits(run_current, True, name)
+        if irun == 31:
+            cur = self._calc_current_from_bits(irun, True, name)
+            if cur < run_current:
+                irun2 = self._calc_current_bits(run_current, False, name)
+                cur2 = self._calc_current_from_bits(irun2, False, name)
+                if abs(run_current - cur2) < abs(run_current - cur):
+                    vsense = False
+                    irun = irun2
+        ihold = self._calc_current_bits(min(hold_current, run_current), vsense, name)
+        return vsense, irun, ihold
+
+    def get_current(self, name):
+        driver = self.tmc_drivers.get(name, None)
+        if driver is None:
+            raise self.printer.command_error(f"Requested TMC driver '{name}' not found")
+        irun = driver['fields'].get_field('irun')
+        ihold = driver['fields'].get_field('ihold')
+        vsense = driver['fields'].get_field("vsense")
+        run_current = self._calc_current_from_bits(irun, vsense, name)
+        hold_current = self._calc_current_from_bits(ihold, vsense, name)
+        req_hold_current = driver['req_hold_current']
+        return run_current, hold_current, req_hold_current, MAX_CURRENT
+
+    def set_current(self, run_current, hold_current, print_time, name):
+        driver = self.tmc_drivers.get(name, None)
+        if driver is None:
+            raise self.printer.command_error(f"Requested TMC driver '{name}' not found")
+        driver['req_hold_current'] = hold_current
+        vsense, irun, ihold = self._calc_current(run_current, hold_current, name)
+        if vsense != driver['fields'].get_field("vsense"):
+            val = driver['fields'].set_field("vsense", vsense)
+            driver['mcu_tmc'].set_register("CHOPCONF", val, print_time)
+        driver['fields'].set_field("ihold", ihold)
+        val = driver['fields'].set_field("irun", irun)
+        driver['mcu_tmc'].set_register("IHOLD_IRUN", val, print_time)
 
 class Dock:
     def __init__(self, config):
@@ -73,6 +159,12 @@ class Dock:
             'cutter_offset_z', None)
         self.cutter_retract_y = config.getfloat(
             'cutter_retract_y', None)
+        
+        self.cutting_current = config.getfloat(
+            'cutting_current', None, minval=0.)
+        self.current_helper = None
+        if self.cutting_current is not None:
+            self.current_helper = TMCCurrentHelper(config)
 
         # Optional custom g-code templates
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -89,6 +181,7 @@ class Dock:
             self.cut_gcode = gcode_macro.load_template(config, 'cut_gcode', '')         
 
         # Initial state
+        self.prev_currents = None
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -129,7 +222,7 @@ class Dock:
                     self.toolhead_detect = instance[1]
                     break
             if self.toolhead_detect is None:
-                raise self.config.error("Missing required toolhead_detect object")
+                raise self.config.error("Missing required toolhead_detect object")   
     
     def cmd_CUT_FILAMENT(self, gcmd):
         self.cut_filament()
@@ -204,9 +297,31 @@ class Dock:
             self.toolhead.move(pos, self.travel_speed)      
             self.toolhead.wait_moves()
 
+            # Raise tmc driver currents
+            if self.cutting_current is not None:
+                self.prev_currents = {}
+                for name, driver in self.current_helper.tmc_drivers.items():
+                    run_current, hold_current, _, max_current = self.current_helper.get_current(name)
+                    self.prev_currents[name] = (run_current, hold_current)
+                    if self.cutting_current > run_current:
+                        cutting_current = min(self.cutting_current, max_current)
+                        print_time = self.toolhead.get_last_move_time()
+                        self.current_helper.set_current(cutting_current, hold_current, print_time, name)
+                        logging.info(f"Set cutting current for driver {name} to {cutting_current}A at time {print_time}")
+
             # Move into cutter
             pos[1] = self.cutter_position_y
             self.toolhead.move(pos, self.cut_speed)
+
+            # Restore tmc driver currents
+            if self.prev_currents is not None:
+                for name, _ in self.current_helper.tmc_drivers.items():
+                    if name in self.prev_currents:
+                        run_current, hold_current = self.prev_currents[name]
+                        print_time = self.toolhead.get_last_move_time()
+                        self.current_helper.set_current(run_current, hold_current, print_time, name)
+                        logging.info(f"Restored current for driver {name} to {run_current}A at time {print_time}")
+                self.prev_currents = None
             
             # Retract from cutter
             pos[1] = self.cutter_position_y + self.cutter_retract_y
