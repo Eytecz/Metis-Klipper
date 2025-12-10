@@ -1,12 +1,25 @@
 # Toolhead docking module - manages complete pickup/dropoff sequences
 # Can optionally use docking_axis for dynamic dock positioning
 #
-# Copyright (C) 2025 Eytecz
+# Copyright (C) 2025 Eytecz Engineering
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import logging
 from extras import tmc2130, tmc2240, tmc2660, tmc5160
+import configparser
+from configfile import ConfigWrapper # type: ignore
+from .led_effect import ledEffect # type: ignore
+
+STATUS_UNINITIALIZED    = 'uninitialized'            # Dock not yet initialized
+STATUS_INITIALIZING     = 'initializing'             # Dock is initializing
+STATUS_DISENGAGED       = 'disengaged'               # Toolhead is undocked, but not on carriage
+STATUS_ENGAGED          = 'engaged'                  # Toolhead is docked on carriage
+STATUS_DOCKED           = 'docked'                   # Toolhead is docked in the dock
+STATUS_UNDOCKING        = 'undocking'                # Toolhead is in the process of undocking
+STATUS_DOCKING          = 'docking'                  # Toolhead is in the process of docking
+STATUS_CUT_FILAMENT     = 'cut_filament'             # Filament is being cut
+STATUS_ERROR            = 'error'                    # Dock is in error state
 
 # Docking axis behaviour options
 axis_modes = {
@@ -58,7 +71,151 @@ class TMCCurrentHelper:
         else:
             raise self.config.error(f"No TMC current helper found for stepper '{stepper_name}'")
 
-class Dock:
+class DockSensorHelper:
+    def __init__(self, config):
+        self.config = config
+        self.printer= config.get_printer()
+
+        # Setup pin and register callback
+        pin = config.get('dock_sensor_pin', None)
+        if pin is not None:
+            buttons = self.printer.load_object(config, 'buttons')
+            buttons.register_debounce_button(pin, self._event_handler, config)
+        
+        # Initial state
+        self.state = False
+
+    def _event_handler(self, eventtime, state):
+        if state == self.state:
+            return
+        self.state = state
+    
+    def query_state(self):
+        return self.state     
+
+class LEDHelper:
+    def __init__(self, config, dock_unit):
+        self.printer = config.get_printer()
+        self.name = config.get_name().split()[1]
+        self.dock_unit = dock_unit
+
+        # Initial state
+        self.state_effects = {}
+        self.nozzle_effects = {}
+
+        # State layer default presets for state LED's
+        LAYER_INITIALIZING = """breathing     2  1     top        (0.0, 0.0, 0.0, 1.0)"""
+        LAYER_DISENGAGED   = """static        0  0     top        (1.0, 0.5, 0.0, 0.0)"""
+        LAYER_ENGAGED      = """static        0  0     top        (0.0, 0.0, 0.0, 1.0)"""
+        LAYER_DOCKED       = """static        0  0     top        (0.0, 0.0, 1.0, 0.0)"""
+        LAYER_UNDOCKING    = """breathing     2  1     top        (1.0, 0.0, 0.0, 0.0)"""
+        LAYER_DOCKING      = """breathing     2  1     top        (0.0, 1.0, 0.0, 0.0)"""
+        LAYER_CUT_FILAMENT = """breathing     2  1     top        (1.0, 0.5, 0.0, 0.0)"""
+        LAYER_ERROR        = """strobe        1  1.5   add        (1.0, 1.0, 1.0, 1.0)
+                                breathing     2  0     difference (1.0, 0.0, 0.0, 0.0)
+                                static        1  0     top        (1.0, 0.0, 0.0, 0.0)"""
+        
+        # State layer default presets for nozzle LED's
+        LAYER_NOZZLE_ENGAGED  = """static        0  0     top     (0.0, 0.0, 0.0, 1.0)"""
+        LAYER_NOZZLE_DOCKED   = """temperature   40 180   top     (0.0, 0.0, 1.0, 0.0),(1.0, 1.0, 0.0, 0.0),(1.0, 0.0, 0.0, 0.0)""" 
+
+        # Read config section
+        self.state_layers = {
+            STATUS_INITIALIZING: config.get('state_layer_initializing', LAYER_INITIALIZING),
+            STATUS_DISENGAGED:   config.get('state_layer_disengaged', LAYER_DISENGAGED),
+            STATUS_ENGAGED:      config.get('state_layer_engaged', LAYER_ENGAGED),
+            STATUS_DOCKED:       config.get('state_layer_docked', LAYER_DOCKED),
+            STATUS_UNDOCKING:    config.get('state_layer_undocking', LAYER_UNDOCKING),
+            STATUS_DOCKING:      config.get('state_layer_docking', LAYER_DOCKING),
+            STATUS_CUT_FILAMENT: config.get('state_layer_cut_filament', LAYER_CUT_FILAMENT),
+            STATUS_ERROR:        config.get('state_layer_error', LAYER_ERROR),
+        }
+
+        self.nozzle_layers = {
+            STATUS_ENGAGED:   config.get('nozzle_layer_engaged', LAYER_NOZZLE_ENGAGED),
+            STATUS_DOCKED:    config.get('nozzle_layer_docked', LAYER_NOZZLE_DOCKED)
+        }
+
+        self.frame_rate = config.getfloat('frame_rate', default=24, minval=1, maxval=60)
+        self.status_leds = config.get('status_leds')
+        self.nozzle_leds = config.get('nozzle_leds', None)
+
+        # Lookup required objects
+        self.configfile = self.printer.lookup_object('configfile')
+
+        # Register event handlers
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+
+    def handle_connect(self):
+        self._create_led_configs()
+
+    def _create_led_configs(self):
+        for state, state_layer in self.state_layers.items():
+            effect_name = f'{self.name}_{state}'
+            effect_config = {
+                'auto_start':   'False',
+                'frame_rate':   str(self.frame_rate),
+                'layers':       state_layer,
+                'leds':         self.status_leds
+            }
+            config, section = self._create_led_config(effect_name, effect_config)
+
+            try:
+                self.printer.add_object(section, self.printer.load_object(config, 'led_effect'))
+                self.state_effects[state] = ledEffect(config)
+                logging.info(f"Created state LED effect '{effect_name}' for state '{state}'")
+            except Exception as e:
+                logging.error(f"Error creating LED effect '{effect_name}': {e}")
+        
+        for state, nozzle_layer in self.nozzle_layers.items():
+            effect_name = f'{self.name}_nozzle_{state}'
+            effect_config = {
+                'auto_start':   'False',
+                'frame_rate':   str(self.frame_rate),
+                'layers':       nozzle_layer,
+                'leds':         self.nozzle_leds
+            }
+
+            # Inject heater when using temperature layer
+            if nozzle_layer and 'temperature' in nozzle_layer:
+                effect_config['heater'] = self.dock_unit.get_extruder_name()
+
+            config, section = self._create_led_config(effect_name, effect_config)
+
+            try:
+                self.printer.add_object(section, self.printer.load_object(config, 'led_effect'))
+                self.nozzle_effects[state] = ledEffect(config)
+                logging.info(f"Created nozzle LED effect '{effect_name}' for state '{state}'")
+            except Exception as e:
+                logging.error(f"Error creating nozzle LED effect '{effect_name}': {e}")
+                   
+    def _create_led_config(self, effect_name, effect_config):
+        # Create a new configparser with the led effect configuration
+        fileconfig = configparser.RawConfigParser()
+        section_name = f"led_effect {effect_name}"
+        fileconfig.add_section(section_name)
+        
+        # Add configuration options
+        for key, value in effect_config.items():
+            fileconfig.set(section_name, key, str(value))
+        
+        # Create ConfigWrapper
+        config_wrapper = ConfigWrapper(self.printer, fileconfig, self.configfile.validate.access_tracking, section_name)
+        return config_wrapper, section_name
+
+    def set_state(self, state):
+        if state not in self.state_effects:
+            logging.warning(f"LED effect for state '{state}' not found")
+            return
+        led_effect = self.state_effects[state]
+        for led in led_effect.leds:
+            for effect in led_effect.handler.effects:
+                if effect is not led_effect and led in effect.leds:
+                    effect.set_enabled(False)
+        led_effect.set_enabled(True)
+
+
+class DockUnit:
     def __init__(self, config):
         self.config = config
         self.printer= config.get_printer()
@@ -69,6 +226,14 @@ class Dock:
         self.extruder_name = config.get('extruder', 'extruder')
         self.filament_sensor = config.get('filament_sensor', None)
         self.toolhead_detect = config.getboolean('toolhead_detect', False)
+        
+        dock_sensor = config.get('dock_sensor', None)
+        if dock_sensor is not None:
+            self.dock_sensor = DockSensorHelper(config)
+
+        status_leds = config.get('status_leds', None)
+        if status_leds:
+            self.led_helper = LEDHelper(config)
 
         self.docking_axis = config.getboolean('docking_axis', False)
         if self.docking_axis:
@@ -139,24 +304,21 @@ class Dock:
             self.cut_gcode = gcode_macro.load_template(config, 'cut_gcode', '')         
 
         # Initial state
+        self.status = STATUS_UNINITIALIZED
         self.prev_currents = None
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
         # Register required objects
         self.gcode = self.printer.lookup_object('gcode')
+                    
 
         # Register g-code commands
         self.gcode.register_mux_command('CUT_FILAMENT', 'DOCK', self.name,
                                         self.cmd_CUT_FILAMENT,
                                         desc="Cut filament using dock cutter")
-        self.gcode.register_mux_command('DOCK_TOOLHEAD', 'DOCK', self.name,
-                                        self.cmd_DOCK_TOOLHEAD,
-                                        desc="Dock the toolhead")
-        self.gcode.register_mux_command('UNDOCK_TOOLHEAD', 'DOCK', self.name,
-                                        self.cmd_UNDOCK_TOOLHEAD,
-                                        desc="Undock the toolhead")
         self.gcode.register_mux_command('DROPOFF_EXTRUDER', 'EXTRUDER', self.extruder_name,
                                         self.cmd_DROPOFF_EXTRUDER,
                                         desc="Drop the specified extruder")
@@ -191,29 +353,29 @@ class Dock:
                     self.toolhead_detect = instance[1]
                     break
             if self.toolhead_detect is None:
-                raise self.config.error("Missing required toolhead_detect object")   
+                raise self.config.error("Missing required toolhead_detect object")
     
+    def handle_ready(self):
+        pass
+
+    def set_status(self, status):
+        if self.status == status:
+            return
+        self.status = status
+        if self.led_helper:
+            self.led_helper.set_state(self.status)
+
+    def initialize_dock(self, eventtime=None):
+        pass
+
+
     def cmd_CUT_FILAMENT(self, gcmd):
         restore_pos = gcmd.get_int('RESTORE_POS', 1)
         try:
             self.cut_filament(bool(restore_pos))
         except Exception as e:
             raise gcmd.error(f"Error cutting filament: {e}")
-    
-    def cmd_DOCK_TOOLHEAD(self, gcmd):
-        restore_pos = gcmd.get_int('RESTORE_POS', 1)
-        try:
-            self.dock_toolhead(bool(restore_pos))
-        except Exception as e:
-            raise gcmd.error(f"Error docking toolhead: {e}")
-    
-    def cmd_UNDOCK_TOOLHEAD(self, gcmd):
-        restore_pos = gcmd.get_int('RESTORE_POS', 1)
-        try:
-            self.undock_toolhead(bool(restore_pos))
-        except Exception as e:
-            raise gcmd.error(f"Error undocking toolhead: {e}")
-    
+       
     def cmd_DROPOFF_EXTRUDER(self, gcmd):
         try:
             self._save_init_pos()
@@ -678,6 +840,12 @@ class Dock:
         
         movepos = [toolhead_movepos_z, docking_axis_movepos_z]
         return movepos
+    
+    def get_extruder_name(self):
+        return self.extruder_name
+    
+    def get_name(self):
+        return self.name
 
 def load_config_prefix(config):
-    return Dock(config)
+    return DockUnit(config)

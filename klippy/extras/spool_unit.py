@@ -1264,6 +1264,9 @@ class SpoolUnit:
     def get_name(self):
         return self.name
 
+    def get_extruder_name(self):
+        return self.extruder_name
+
     def get_status(self, eventtime):
         return {
             'status': self.status,

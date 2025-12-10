@@ -1,6 +1,6 @@
 # PurgeBelt module for klipper
 #
-# Copyright (C) 2025 Eytecz
+# Copyright (C) 2025 Eytecz Engineering
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
