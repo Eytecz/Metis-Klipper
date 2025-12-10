@@ -159,9 +159,9 @@ class ToolheadDetect:
             raise self.printer.command_error(str(e))
         
     def cmd_ENABLE_TOOLHEAD_DETECT(self, gcmd):
-        state = bool(gcmd.get_int('STATE', 1))
-        self.enable(state)
-        gcmd.respond_info(f"Toolhead {self.name} detection {'enabled' if state else 'disabled'}")
+        enable = bool(gcmd.get_int('ENABLE', 1))
+        self.enable(enable)
+        gcmd.respond_info(f"Toolhead {self.name} detection {'enabled' if enable else 'disabled'}")
 
     def enable(self, state=True):
         if self.enabled == state:
@@ -191,6 +191,9 @@ class ToolheadDetect:
     
     def query_pending_state(self):
         return bool(self.pending_state)
+
+    def get_enabled(self):
+        return self.enabled
 
     def get_name(self):
         return self.name
