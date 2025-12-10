@@ -348,6 +348,9 @@ class DockUnit:
                     
 
         # Register g-code commands
+        self.gcode.register_mux_command('INITIALIZE_DOCK', 'DOCK', self.name,
+                                        self.cmd_INITIALIZE_DOCK,
+                                        desc="Initialize the dock unit")
         self.gcode.register_mux_command('CUT_FILAMENT', 'DOCK', self.name,
                                         self.cmd_CUT_FILAMENT,
                                         desc="Cut filament using dock cutter")
@@ -399,15 +402,15 @@ class DockUnit:
 
     def initialize_dock_unit(self, eventtime=None):
         self.set_status(STATUS_INITIALIZING)
-        # If toolhead detection is not configured or disabled, set to uninitialized
-        if not self.toolhead_detect or not self.toolhead_detect.get_enabled():
+        # If toolhead detection is not configured, set to uninitialized
+        if not self.toolhead_detect:
             self.set_status(STATUS_UNINITIALIZED)
             logging.info(f"Dock {self.name} initialized without toolhead detection, status set to uninitialized")
             return self.reactor.NEVER
         
         # Query toolhead detect state and dock sensor if configured
         if self.toolhead_detect.query_state_blocking():
-            if self.dock_sensor and self.dock_sensor.get_enabled():
+            if self.dock_sensor:
                 if self.dock_sensor.query_state():
                     self.set_status(STATUS_ERROR)
                     logging.error(f"Dock {self.name} initialization error: Toolhead detected as mounted but dock sensor indicates docked")
@@ -415,14 +418,25 @@ class DockUnit:
             self.set_status(STATUS_ENGAGED)
             logging.info(f"Dock {self.name} initialized, toolhead detected as mounted, status set to engaged")
         else:
-            if self.dock_sensor and self.dock_sensor.get_enabled():
+            if self.dock_sensor:
                 if self.dock_sensor.query_state():
                     self.set_status(STATUS_DOCKED)
                     logging.info(f"Dock {self.name} initialized, dock sensor indicates docked, status set to docked")
                     return self.reactor.NEVER
-            self.set_status(STATUS_UNDOCKED)
-            logging.info(f"Dock {self.name} initialized, toolhead not mounted and dock sensor indicates undocked, status set to undocked")             
+                else:
+                    self.set_status(STATUS_UNDOCKED)
+                    logging.info(f"Dock {self.name} initialized, toolhead not mounted and dock sensor indicates undocked, status set to undocked")
+            else:
+                self.set_status(STATUS_DOCKED)
+                logging.info(f"Dock {self.name} initialized, toolhead not mounted (assuming docked), status set to docked")             
         return self.reactor.NEVER
+
+    def cmd_INITIALIZE_DOCK(self, gcmd):
+        try:
+            self.initialize_dock_unit()
+            gcmd.respond_info(f"Dock {self.name} initialized, status: {self.status}")
+        except Exception as e:
+            raise gcmd.error(f"Error initializing dock: {e}")   
 
     def cmd_CUT_FILAMENT(self, gcmd):
         restore_pos = gcmd.get_int('RESTORE_POS', 1)
