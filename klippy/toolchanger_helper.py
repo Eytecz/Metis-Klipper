@@ -176,6 +176,7 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock.filament_cutter:
                 if active_dock.filament_sensor.runout_helper.filament_present:
+                    tool['dock_unit'].save_init_pos()
                     active_dock.cut_filament(restore_pos=True)
             tool['spool_unit'].spool_load()
             if self.post_change_gcode is not None:
