@@ -538,7 +538,7 @@ class DockUnit:
     def cmd_SET_AXIS_MODE(self, gcmd):
         mode = gcmd.get('MODE')
         if mode not in axis_modes:
-            raise self.printer.command_error(
+            raise gcmd.error(
                 f"Invalid axis mode '{mode}', valid modes are: {', '.join(axis_modes.keys())}.")
         self.axis_mode = mode
         gcmd.respond_info(f"Dock {self.name} axis mode set to {self.axis_mode}.")

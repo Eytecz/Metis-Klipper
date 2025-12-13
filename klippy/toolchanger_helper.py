@@ -107,7 +107,7 @@ class ToolchangerHelper:
                 self.gcode.run_script_from_command("UNSELECT_TOOL")
             except Exception as unselect_error:
                 logging.error(f"Failed to run UNSELECT_TOOL script: {str(unselect_error)}")
-            raise self.printer.command_error("Tool request failed: %s" % str(e))
+            raise gcmd.error("Tool request failed: %s" % str(e))
 
     def get_tool_name(self, tool_number):
         for tool, tool_contents in self.tools.items():
@@ -218,13 +218,13 @@ class ToolchangerHelper:
         try:
             self.restore_toolchanger()
         except Exception as e:
-            raise self.printer.command_error("Restore toolchanger failed: %s" % str(e))
+            raise gcmd.error("Restore toolchanger failed: %s" % str(e))
         
     def restore_toolchanger(self):
         try:
             self.toolchanger.status = 'ready'
-        except Exception as e:
-            raise self.printer.command_error("Restore toolchanger failed: %s" % str(e))
+        except Exception:
+            raise
 
 
 def load_config(config):

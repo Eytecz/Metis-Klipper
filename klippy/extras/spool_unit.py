@@ -542,19 +542,19 @@ class SpoolUnit:
         try:
             self.spool_load()
         except Exception as e:
-            self.handle_exception(e, "spool load", pause_on_error=True)
+            raise gcmd.error(f"Spool load error for spool unit {self.name}: {e}")
 
     def cmd_SPOOL_UNLOAD(self, gcmd):
         try:
             self.spool_unload()
         except Exception as e:
-            self.handle_exception(e, "spool unload", pause_on_error=True)
+            raise gcmd.error(f"Spool unload error for spool unit {self.name}: {e}")
 
     def cmd_SPOOL_EJECT(self, gcmd):
         try:
             self.spool_eject()
         except Exception as e:
-            self.handle_exception(e, "spool eject", pause_on_error=True)
+            raise gcmd.error(f"Spool eject error for spool unit {self.name}: {e}")
         
     def cmd_CLEAR_ERROR(self, gcmd):
         if self.status != STATUS_ERROR:
@@ -637,7 +637,7 @@ class SpoolUnit:
         try:
             self.calibrate_bowden_length()
         except Exception as e:
-            self.handle_exception(e, "calibrate bowden length", pause_on_error=True)
+            raise gcmd.error(f"Bowden length calibration error for spool unit {self.name}: {e}")
 
     def calibrate_bowden_length(self):
         if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
