@@ -6,6 +6,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import logging
+import traceback
 from extras import tmc2130, tmc2240, tmc2660, tmc5160
 import configparser
 from configfile import ConfigWrapper # type: ignore
@@ -71,49 +72,6 @@ class TMCCurrentHelper:
         else:
             raise self.config.error(f"No TMC current helper found for stepper '{stepper_name}'")
 
-class DockSensorHelper:
-    def __init__(self, config):
-        self.config = config
-        self.printer= config.get_printer()
-        self.name = config.get_name().split()[1]
-
-        # Setup pin and register callback
-        pin = config.get('dock_sensor_pin', None)
-        if pin is not None:
-            buttons = self.printer.load_object(config, 'buttons')
-            buttons.register_debounce_button(pin, self._event_handler, config)
-        
-        # Initial state
-        self.state = False
-        self.enabled = True
-
-        # Register g-code commands
-        self.gcode = self.printer.lookup_object('gcode')
-        self.gcode.register_mux_command('ENABLE_DOCK_DETECT', 'DOCK', self.name,
-                                        self.cmd_ENABLE_DOCK_DETECT,
-                                        desc="Enable dock engagement detection")
-
-    def _event_handler(self, eventtime, state):
-        if state == self.state:
-            return
-        self.state = state
-    
-    def cmd_ENABLE_DOCK_DETECT(self, gcmd):
-        enable = bool(gcmd.get_int('ENABLE', 1))
-        self.enable(enable)
-        gcmd.respond_info(f"Dock {self.name} detection {'enabled' if self.enabled else 'disabled'}")
-    
-    def enable(self, state=True):
-        if self.enabled == state:
-            return
-        self.enabled = state
-
-    def query_state(self):
-        return self.state
-
-    def get_enabled(self):
-        return self.enabled    
-
 class LEDHelper:
     def __init__(self, config, dock_unit):
         self.printer = config.get_printer()
@@ -168,9 +126,13 @@ class LEDHelper:
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
     def handle_connect(self):
         self._create_led_configs()
+    
+    def handle_ready(self):
+        self.dock_unit.led_ready = True
 
     def _create_led_configs(self):
         for state, state_layer in self.state_layers.items():
@@ -254,13 +216,9 @@ class DockUnit:
         self.name = config.get_name().split()[1]
         self.extruder_name = config.get('extruder', 'extruder')
         self.filament_sensor = config.get('filament_sensor', None)
-        self.toolhead_detect = config.getboolean('toolhead_detect', False)
+        self.toolhead_detect_shuttle = config.get('toolhead_detect_shuttle', None)
+        self.toolhead_detect_dock = config.get('toolhead_detect_dock', None)
         
-        dock_sensor = config.get('dock_sensor', None)
-        self.dock_sensor = None
-        if dock_sensor is not None:
-            self.dock_sensor = DockSensorHelper(config)
-
         status_leds = config.get('status_leds', None)
         self.led_helper = None
         if status_leds:
@@ -332,11 +290,16 @@ class DockUnit:
 
         self.cut_gcode = None
         if config.get('cut_gcode', None) is not None:
-            self.cut_gcode = gcode_macro.load_template(config, 'cut_gcode', '')         
+            self.cut_gcode = gcode_macro.load_template(config, 'cut_gcode', '')
+
+        self.exception_pause = config.getboolean('pause_on_exception', True)
+        if self.exception_pause or config.get('exception_gcode', None) is not None:
+            self.exception_gcode = gcode_macro.load_template(config, 'exception_gcode', '')       
 
         # Initial state
         self.status = STATUS_UNINITIALIZED
         self.prev_currents = None
+        self.led_ready = False
         
 
         # Register event handlers
@@ -351,6 +314,9 @@ class DockUnit:
         self.gcode.register_mux_command('INITIALIZE_DOCK', 'DOCK', self.name,
                                         self.cmd_INITIALIZE_DOCK,
                                         desc="Initialize the dock unit")
+        self.gcode.register_mux_command('SET_DOCK_STATUS', 'DOCK', self.name,
+                                        self.cmd_SET_DOCK_STATUS,
+                                        desc="Set the dock unit status")
         self.gcode.register_mux_command('CUT_FILAMENT', 'DOCK', self.name,
                                         self.cmd_CUT_FILAMENT,
                                         desc="Cut filament using dock cutter")
@@ -381,45 +347,112 @@ class DockUnit:
         if self.docking_axis is True:
             self.docking_axis = self.printer.lookup_object('docking_axis')
 
-        if self.toolhead_detect is True:
-            self.toolhead_detect = None
-            for instance in self.printer.lookup_objects('toolhead_detect'):
-                if instance[1].get_extruder_name() == self.extruder_name:
-                    self.toolhead_detect = instance[1]
+        if self.toolhead_detect_shuttle is not None:
+            found = False
+            for name, instance in self.printer.lookup_objects('toolhead_detect'):
+                if instance.get_name() == self.toolhead_detect_shuttle:
+                    logging.info(f"Found toolhead_detect shuttle: {instance.name}")
+                    self.toolhead_detect_shuttle = instance
+                    found = True
                     break
-            if self.toolhead_detect is None:
-                raise self.config.error("Missing required toolhead_detect object")
+            if not found:
+                raise self.config.error("Missing required toolhead_detect shuttle object")
+        
+        if self.toolhead_detect_dock is not None:
+            found = False
+            for name, instance in self.printer.lookup_objects('toolhead_detect'):
+                if instance.get_name() == self.toolhead_detect_dock:
+                    self.toolhead_detect_dock = instance
+                    found = True
+                    break
+            if not found:
+                raise self.config.error("Missing required toolhead_detect dock object")
+        
+        # Register state change callbacks for toolhead_detect sensors
+        if self.toolhead_detect_shuttle is not None:
+            self.toolhead_detect_shuttle.register_callback(
+                self.toolhead_detect_callback)
+        if self.toolhead_detect_dock is not None:
+            self.toolhead_detect_dock.register_callback(
+                self.toolhead_detect_callback)
     
     def handle_ready(self):
         self.reactor.register_timer(self.initialize_dock_unit, self.reactor.monotonic() + 2.0)
+
+    def handle_exception(self, exception, context, pause_on_error=True):
+        # Log the error with context
+        logging.error(f"Error in {context} for toolhead {self.name}: {exception}")
+        logging.error(traceback.format_exc())
+
+        # Set status to ERROR
+        self.set_status(STATUS_ERROR)
+
+        # Ensure all moves are done and update position
+        self.toolhead.wait_moves()
+        self.toolhead.set_position(self.toolhead.get_position())
+
+        # Check printer status and pause if required
+        if pause_on_error:
+            idle_timeout = self.printer.lookup_object('idle_timeout')
+            is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
+            if is_printing:
+                pause_prefix = ""
+                if self.exception_pause:
+                    pause_resume = self.printer.lookup_object('pause_resume')
+                    pause_resume.send_pause_command()
+                    pause_prefix = "PAUSE\n"
+                    self.reactor.pause(self.reactor.monotonic() + 0.5)
+                self._exec_gcode(pause_prefix, self.exception_gcode)
+                msg = (
+                    f"{str(exception)} Printing has been paused. Please resolve the issue before resuming.")
+                if context == "initializing":
+                    return self.reactor.NEVER
+                else:
+                    raise Exception(msg)
+        
+        msg = (
+            f"{str(exception)} Printing has not been paused. Please resolve the issue before continuing."
+        )
+
+        if context == "initializing":
+            return self.reactor.NEVER
+        else:
+            raise Exception(msg)
+
+    def _exec_gcode(self, prefix, template):
+        try:
+            self.gcode.run_script_from_command(prefix + template.render() + "\nM400")
+        except Exception as e:
+           self.handle_exception(e, "_exec_gcode", pause_on_error=True)
 
     def set_status(self, status):
         if self.status == status:
             return
         self.status = status
         if self.led_helper:
-            self.led_helper.set_state(self.status)
+            if self.led_ready:
+                self.led_helper.set_state(self.status)
 
     def initialize_dock_unit(self, eventtime=None):
         self.set_status(STATUS_INITIALIZING)
         # If toolhead detection is not configured, set to uninitialized
-        if not self.toolhead_detect:
+        if not self.toolhead_detect_shuttle:
             self.set_status(STATUS_UNINITIALIZED)
-            logging.info(f"Dock {self.name} initialized without toolhead detection, status set to uninitialized")
+            logging.info(f"Dock {self.name} initialized without toolhead detection, status set to uninitialized.")
             return self.reactor.NEVER
         
         # Query toolhead detect state and dock sensor if configured
-        if self.toolhead_detect.query_state_blocking():
-            if self.dock_sensor:
-                if self.dock_sensor.query_state():
+        if self.toolhead_detect_shuttle.query_state_blocking():
+            if self.toolhead_detect_dock:
+                if self.toolhead_detect_dock.query_state_blocking():
                     self.set_status(STATUS_ERROR)
                     logging.error(f"Dock {self.name} initialization error: Toolhead detected as mounted but dock sensor indicates docked")
                     return self.reactor.NEVER
             self.set_status(STATUS_ENGAGED)
             logging.info(f"Dock {self.name} initialized, toolhead detected as mounted, status set to engaged")
         else:
-            if self.dock_sensor:
-                if self.dock_sensor.query_state():
+            if self.toolhead_detect_dock:
+                if self.toolhead_detect_dock.query_state_blocking():
                     self.set_status(STATUS_DOCKED)
                     logging.info(f"Dock {self.name} initialized, dock sensor indicates docked, status set to docked")
                     return self.reactor.NEVER
@@ -431,12 +464,51 @@ class DockUnit:
                 logging.info(f"Dock {self.name} initialized, toolhead not mounted (assuming docked), status set to docked")             
         return self.reactor.NEVER
 
+    def toolhead_detect_callback(self, state):
+        if self.status not in [STATUS_CUT_FILAMENT, STATUS_DOCKING, STATUS_UNDOCKING]:
+            try:
+                # Figure out what the new toolhead status is
+                if self.toolhead_detect_shuttle.query_state_blocking():
+                    if self.toolhead_detect_dock:
+                        if self.toolhead_detect_dock.query_state_blocking():
+                            self.set_status(STATUS_ERROR)
+                    self.set_status(STATUS_ENGAGED)
+                else:
+                    if self.toolhead_detect_dock:
+                        if self.toolhead_detect_dock.query_state_blocking():
+                            self.set_status(STATUS_DOCKED)
+                        else:
+                            self.set_status(STATUS_UNDOCKED)
+                    else:
+                        self.set_status(STATUS_DOCKED)
+            except Exception as e:
+                self.handle_exception(e, "toolhead_detect_callback", pause_on_error=False)
+
     def cmd_INITIALIZE_DOCK(self, gcmd):
         try:
             self.initialize_dock_unit()
             gcmd.respond_info(f"Dock {self.name} initialized, status: {self.status}")
         except Exception as e:
-            raise gcmd.error(f"Error initializing dock: {e}")   
+            raise gcmd.error(f"Error initializing dock: {e}")
+
+    def cmd_SET_DOCK_STATUS(self, gcmd):
+        status = gcmd.get('STATUS')
+        valid_statuses = [
+            STATUS_UNINITIALIZED,
+            STATUS_INITIALIZING,
+            STATUS_UNDOCKED,
+            STATUS_ENGAGED,
+            STATUS_DOCKED,
+            STATUS_UNDOCKING,
+            STATUS_DOCKING,
+            STATUS_CUT_FILAMENT,
+            STATUS_ERROR
+        ]
+        if status not in valid_statuses:
+            raise gcmd.error(
+                f"Invalid dock status '{status}', valid statuses are: {', '.join(valid_statuses)}")
+        self.set_status(status)
+        gcmd.respond_info(f"Dock {self.name} status set to {self.status}")   
 
     def cmd_CUT_FILAMENT(self, gcmd):
         restore_pos = gcmd.get_int('RESTORE_POS', 1)
@@ -447,7 +519,7 @@ class DockUnit:
        
     def cmd_DROPOFF_EXTRUDER(self, gcmd):
         try:
-            self._save_init_pos()
+            self.save_init_pos()
             cut_filament = gcmd.get_int('CUT_FILAMENT', 1)
             if cut_filament:
                 self.cut_filament(restore_pos=False)
@@ -459,7 +531,7 @@ class DockUnit:
         try:
             self.undock_toolhead(restore_pos=False)
             if self.last_toolhead_pos is not None:
-                self._restore_last_pos(restore_axes=True)
+                self.restore_last_pos(restore_axes=True)
         except Exception as e:
             raise gcmd.error(f"Error picking up extruder: {e}")
 
@@ -467,352 +539,403 @@ class DockUnit:
         mode = gcmd.get('MODE')
         if mode not in axis_modes:
             raise self.printer.command_error(
-                f"Invalid axis mode '{mode}', valid modes are: {', '.join(axis_modes.keys())}")
+                f"Invalid axis mode '{mode}', valid modes are: {', '.join(axis_modes.keys())}.")
         self.axis_mode = mode
-        gcmd.respond_info(f"Dock {self.name} axis mode set to {self.axis_mode}")
+        gcmd.respond_info(f"Dock {self.name} axis mode set to {self.axis_mode}.")
         
     def cut_filament(self, restore_pos=True):
-        # Check if modules are homed and ready for motion
-        self._enabled_check()
-        
-        # Save current positions for restore after operation
-        if restore_pos:
-            self._save_init_pos()
+        try:
+            # Check dock status and set to cutting state
+            if self.status not in STATUS_ENGAGED:
+                raise Exception(
+                    f"Cannot cut filament, dock {self.name} status is '{self.status}', must be '{STATUS_ENGAGED}'.")
+            self.set_status(STATUS_CUT_FILAMENT)
 
-        # Check if filament cutter is configured
-        if not self.filament_cutter:
-            raise self.printer.command_error(
-                f"Filament cutter not configured for dock {self.name}")
-        
-        # Check if toolhead is mounted
-        if self.toolhead_detect:
-            if not self.toolhead_detect.query_state_blocking():
-                raise self.printer.command_error(
-                    f"Toolhead not mounted, cannot cut filament on dock {self.name}")
-        
-        # Check if toolhead has filament loaded
-        if self.filament_sensor:
-            if not self.filament_sensor.runout_helper.filament_present:
-                raise self.printer.command_error(
-                    f"No filament detected, cannot cut filament on dock {self.name}")
-        
-        # Check if custom cut g-code is defined else perform standard cut sequence
-        if self.cut_gcode is not None:
-            try:
-                self.gcode.run_script_from_command(self.cut_gcode.render() + "\nM400")
-            except Exception as e:
-                raise self.printer.command_error(f"Error executing cut gcode: {e}")
-        else:
-            # Determine z-axis and docking axis positions for cutting
-            movepos_z = self._determine_movepos_z(self.cutter_offset_z)
-            if movepos_z is [None, None]:
-                raise self.printer.command_error(
-                    f"Cannot achieve cutter offset z={self.cutter_offset_z}mm with current positions")
-
-            # Get current toolhead position
-            pos = self.toolhead.get_position()
-
-            # Move to safe xy position in front of dock
-            pos[0] = self.docked_position_x
-            pos[1] = self.safe_position_y
-            self.toolhead.move(pos, self.travel_speed)
+            # Check if modules are homed and ready for motion
+            self._enabled_check()
             
-            # Move z-axis and possibly docking axis to desired height
-            if movepos_z[1] is not None:
-                speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
-                self.docking_axis.stepper.do_move(
-                    movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
-                )
-            if movepos_z[0] is not None:
-                pos[2] = movepos_z[0]
-                self.toolhead.move(pos, self.travel_speed)
-            self.toolhead.wait_moves()
+            # Save current positions for restore after operation
+            if restore_pos:
+                self.save_init_pos()
+
+            # Check if filament cutter is configured
+            if not self.filament_cutter:
+                raise Exception(
+                    f"Filament cutter not configured for dock {self.name}.")
             
-            # Move to cutter xy position
-            pos = self.toolhead.get_position()
-            pos[0] = self.cutter_position_x
-            pos[1] = self.cutter_position_y + self.cutter_retract_y
-            self.toolhead.move(pos, self.travel_speed)      
+            # Check if toolhead is mounted
+            if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                if not self.toolhead_detect_shuttle.query_state_blocking():
+                    raise Exception(
+                        f"Toolhead not mounted, cannot cut filament on dock {self.name}.")
+            
+            # Check if toolhead has filament loaded
+            if self.filament_sensor:
+                if not self.filament_sensor.runout_helper.filament_present:
+                    raise Exception(
+                        f"No filament detected, cannot cut filament on dock {self.name}.")
+            
+            # Check if custom cut g-code is defined else perform standard cut sequence
+            if self.cut_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.cut_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Error executing cut gcode: {e}")
+            else:
+                # Determine z-axis and docking axis positions for cutting
+                movepos_z = self._determine_movepos_z(self.cutter_offset_z)
+                if movepos_z is [None, None]:
+                    raise Exception(
+                        f"Cannot achieve cutter offset z={self.cutter_offset_z}mm with current positions.")
 
-            # Raise tmc driver currents
-            if self.cutting_current is not None:
-                self.prev_currents = {}
-                for name, _ in self.current_helper.tmc_helpers.items():
-                    run_current, hold_current, _, max_current = self.current_helper.get_current(name)
-                    self.prev_currents[name] = (run_current, hold_current)
-                    if self.cutting_current > run_current:
-                        cutting_current = min(self.cutting_current, max_current)
-                        print_time = self.toolhead.get_last_move_time()
-                        self.current_helper.set_current(cutting_current, hold_current, print_time, name)
-                        logging.info(f"Set cutting current for driver {name} to {cutting_current}A at time {print_time}")
-
-            # Move into cutter
-            pos[1] = self.cutter_position_y
-            self.toolhead.move(pos, self.cut_speed)
-
-            # Restore tmc driver currents
-            if self.prev_currents is not None:
-                for name, _ in self.current_helper.tmc_helpers.items():
-                    if name in self.prev_currents:
-                        run_current, hold_current = self.prev_currents[name]
-                        print_time = self.toolhead.get_last_move_time()
-                        self.current_helper.set_current(run_current, hold_current, print_time, name)
-                        logging.info(f"Restored current for driver {name} to {run_current}A at time {print_time}")
-                self.prev_currents = None
-                        
-            # Retract from cutter
-            pos[1] = self.cutter_position_y + self.cutter_retract_y
-            self.toolhead.move(pos, self.travel_speed)
-
-            # Release tension on blade so it can retract (temporarily bypass extrude check)
-            extruder = self.printer.lookup_object(self.extruder_name)
-            can_extrude_original = extruder.heater.can_extrude  # Save current value
-            try:
-                extruder.heater.can_extrude = True  # Override to allow movement
+                # Get current toolhead position
                 pos = self.toolhead.get_position()
-                pos[3] -= 2.0
-                self.toolhead.move(pos, 10.0)
-                pos[3] += 2.0
-                self.toolhead.move(pos, 10.0)
-            finally:
-                extruder.heater.can_extrude = can_extrude_original  # Always restore
 
-        # Restore previous positions
-        if restore_pos:
-            self._restore_last_pos(restore_axes=True)
-        else:
-            # Cleanup current position from toolhead
-            self.toolhead.wait_moves()
-            self.toolhead.set_position(self.toolhead.get_position())
+                # Move to safe xy position in front of dock
+                pos[0] = self.docked_position_x
+                pos[1] = self.safe_position_y
+                self.toolhead.move(pos, self.travel_speed)
+                
+                # Move z-axis and possibly docking axis to desired height
+                if movepos_z[1] is not None:
+                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    self.docking_axis.stepper.do_move(
+                        movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
+                    )
+                if movepos_z[0] is not None:
+                    pos[2] = movepos_z[0]
+                    self.toolhead.move(pos, self.travel_speed)
+                self.toolhead.wait_moves()
+                
+                # Move to cutter xy position
+                pos = self.toolhead.get_position()
+                pos[0] = self.cutter_position_x
+                pos[1] = self.cutter_position_y + self.cutter_retract_y
+                self.toolhead.move(pos, self.travel_speed)      
+
+                # Raise tmc driver currents
+                if self.cutting_current is not None:
+                    self.prev_currents = {}
+                    for name, _ in self.current_helper.tmc_helpers.items():
+                        run_current, hold_current, _, max_current = self.current_helper.get_current(name)
+                        self.prev_currents[name] = (run_current, hold_current)
+                        if self.cutting_current > run_current:
+                            cutting_current = min(self.cutting_current, max_current)
+                            print_time = self.toolhead.get_last_move_time()
+                            self.current_helper.set_current(cutting_current, hold_current, print_time, name)
+                            logging.info(f"Set cutting current for driver {name} to {cutting_current}A at time {print_time}")
+
+                # Move into cutter
+                pos[1] = self.cutter_position_y
+                self.toolhead.move(pos, self.cut_speed)
+
+                # Restore tmc driver currents
+                if self.prev_currents is not None:
+                    for name, _ in self.current_helper.tmc_helpers.items():
+                        if name in self.prev_currents:
+                            run_current, hold_current = self.prev_currents[name]
+                            print_time = self.toolhead.get_last_move_time()
+                            self.current_helper.set_current(run_current, hold_current, print_time, name)
+                            logging.info(f"Restored current for driver {name} to {run_current}A at time {print_time}")
+                    self.prev_currents = None
+                            
+                # Retract from cutter
+                pos[1] = self.cutter_position_y + self.cutter_retract_y
+                self.toolhead.move(pos, self.travel_speed)
+
+                # Release tension on blade so it can retract (temporarily bypass extrude check)
+                extruder = self.printer.lookup_object(self.extruder_name)
+                can_extrude_original = extruder.heater.can_extrude  # Save current value
+                try:
+                    extruder.heater.can_extrude = True  # Override to allow movement
+                    pos = self.toolhead.get_position()
+                    pos[3] -= 2.0
+                    self.toolhead.move(pos, 10.0)
+                    pos[3] += 2.0
+                    self.toolhead.move(pos, 10.0)
+                finally:
+                    extruder.heater.can_extrude = can_extrude_original  # Always restore
+
+            # Restore previous positions
+            if restore_pos:
+                self.restore_last_pos(restore_axes=True)
+            else:
+                # Cleanup current position from toolhead
+                self.toolhead.wait_moves()
+                self.toolhead.set_position(self.toolhead.get_position())
+            
+            # Verify that toolhead is still engaged
+            if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                self.toolhead.wait_moves()
+                if not self.toolhead_detect_shuttle.query_state_blocking():
+                    raise Exception(
+                        f"Toolhead no longer detected as mounted after cutting filament on dock {self.name}.")
+            self.set_status(STATUS_ENGAGED)
+        except Exception as e:
+            self.handle_exception(e, "cutting", pause_on_error=self.exception_pause)
 
     def dock_toolhead(self, restore_pos=True):
-        # Check if modules are homed and ready for motion
-        self._enabled_check()
+        try:
+            # Check dock status and set to docking state
+            if self.status not in STATUS_ENGAGED:
+                raise Exception(
+                    f"Cannot dock toolhead, dock {self.name} status is '{self.status}', must be '{STATUS_ENGAGED}'.")
+            self.set_status(STATUS_DOCKING)
+            # Check if modules are homed and ready for motion
+            self._enabled_check()
 
-        # Save current positions for restore after operation
-        if restore_pos:
-            self._save_init_pos()
-        
-        # Check if toolhead is mounted
-        if self.toolhead_detect:
-            if not self.toolhead_detect.query_state_blocking():
-                raise self.printer.command_error(
-                    f"Toolhead not mounted, cannot dock on dock {self.name}")
-        
-        # Check if custom docking g-code is defined else perform standard docking sequence
-        if self.docking_gcode is not None:
-            try:
-                self.gcode.run_script_from_command(self.docking_gcode.render() + "\nM400")
-            except Exception as e:
-                raise self.printer.command_error(f"Error executing docking gcode: {e}")
-        else:
-            # Determine z-axis and docking axis positions for docking
-            if self.axis_mode == 'static' and self.docking_axis is False:
-                target_z_offset = self.docked_position_z + self.safe_offset_z
-            else:
-                target_z_offset = self.docked_offset_z + self.safe_offset_z
-            movepos_z = self._determine_movepos_z(target_z_offset)
-            if movepos_z is [None, None]:
-                raise self.printer.command_error(
-                    f"Cannot achieve docked offset z={target_z_offset}mm with current positions")
+            # Save current positions for restore after operation
+            if restore_pos:
+                self.save_init_pos()
             
-            # Get current toolhead position
-            pos = self.toolhead.get_position()
-
-            # Move to safe xy position in front of dock
-            pos[0] = self.docked_position_x
-            if self.cutter_position_y is not None and self.cutter_retract_y is not None:
-                pos[1] = self.cutter_position_y + self.cutter_retract_y
+            # Check if toolhead is mounted
+            if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                if not self.toolhead_detect_shuttle.query_state_blocking():
+                    raise Exception(
+                        f"Toolhead not mounted, cannot dock on dock {self.name}.")
+            
+            # Check if custom docking g-code is defined else perform standard docking sequence
+            if self.docking_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.docking_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Error executing docking gcode: {e}")
             else:
-                pos[1] = self.safe_position_y
-            self.toolhead.move(pos, self.travel_speed)
+                # Determine z-axis and docking axis positions for docking
+                if self.axis_mode == 'static' and self.docking_axis is False:
+                    target_z_offset = self.docked_position_z + self.safe_offset_z
+                else:
+                    target_z_offset = self.docked_offset_z + self.safe_offset_z
+                movepos_z = self._determine_movepos_z(target_z_offset)
+                if movepos_z is [None, None]:
+                    raise Exception(
+                        f"Cannot achieve docked offset z={target_z_offset}mm with current positions.")
+                
+                # Get current toolhead position
+                pos = self.toolhead.get_position()
 
-            # Move z-axis and possibly docking axis to desired height (slightly above dock)
-            if movepos_z[1] is not None:
-                speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
-                self.docking_axis.stepper.do_move(
-                    movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
-                )
-            if movepos_z[0] is not None:
-                pos[2] = movepos_z[0]
+                # Move to safe xy position in front of dock
+                pos[0] = self.docked_position_x
+                if self.cutter_position_y is not None and self.cutter_retract_y is not None:
+                    pos[1] = self.cutter_position_y + self.cutter_retract_y
+                else:
+                    pos[1] = self.safe_position_y
                 self.toolhead.move(pos, self.travel_speed)
-            self.toolhead.wait_moves()
 
-            # Move into dock position (before slide step)
-            pos = self.toolhead.get_position()
-            pos[0] = self.docked_position_x
-            pos[1] = self.docked_position_y + self.slide_distance_y
-            self.toolhead.move(pos, self.docking_speed)
-
-            # Lower to docked position
-            pos = self.toolhead.get_position()
-            pos[2] -= self.safe_offset_z
-            self.toolhead.move(pos, self.docking_speed)
-
-            # Slide into dock
-            pos[1] = self.docked_position_y
-            self.toolhead.move(pos, self.docking_speed)
-
-            # Disengage toolhead
-            pos[2] -= self.disengage_offset_z
-            self.toolhead.move(pos, self.disengage_speed)
-
-            # Back away from coupling
-            pos[1] += self.disengage_offset_y
-            self.toolhead.move(pos, self.disengage_speed)
-
-            # Verify that toolhead is no longer mounted
-            if self.toolhead_detect:
+                # Move z-axis and possibly docking axis to desired height (slightly above dock)
+                if movepos_z[1] is not None:
+                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    self.docking_axis.stepper.do_move(
+                        movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
+                    )
+                if movepos_z[0] is not None:
+                    pos[2] = movepos_z[0]
+                    self.toolhead.move(pos, self.travel_speed)
                 self.toolhead.wait_moves()
-                if self.toolhead_detect.query_state_blocking():
-                    raise self.printer.command_error(
-                        f"Toolhead still detected as mounted after docking on dock {self.name}")
 
-        # Restore previous positions
-        if restore_pos:
-            pos[2] = self.safe_position_y
-            self.toolhead.move(pos, self.travel_speed)
-            self._restore_last_pos(restore_axes=True)
-        else:
-            # Cleanup current position from toolhead
-            self.toolhead.wait_moves()
-            self.toolhead.set_position(self.toolhead.get_position())
+                # Move into dock position (before slide step)
+                pos = self.toolhead.get_position()
+                pos[0] = self.docked_position_x
+                pos[1] = self.docked_position_y + self.slide_distance_y
+                self.toolhead.move(pos, self.docking_speed)
+
+                # Lower to docked position
+                pos = self.toolhead.get_position()
+                pos[2] -= self.safe_offset_z
+                self.toolhead.move(pos, self.docking_speed)
+
+                # Slide into dock
+                pos[1] = self.docked_position_y
+                self.toolhead.move(pos, self.docking_speed)
+
+                # Disengage toolhead
+                pos[2] -= self.disengage_offset_z
+                self.toolhead.move(pos, self.disengage_speed)
+
+                # Back away from coupling
+                pos[1] += self.disengage_offset_y
+                self.toolhead.move(pos, self.disengage_speed)
+
+                # Verify that toolhead is no longer mounted
+                if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                    self.toolhead.wait_moves()
+                    if self.toolhead_detect_shuttle.query_state_blocking():
+                        raise Exception(
+                            f"Toolhead still detected as mounted after docking on dock {self.name}.")
+
+                # Verify dock sensor if configured
+                if self.toolhead_detect_dock and self.toolhead_detect_dock.get_enabled():
+                    if not self.toolhead_detect_dock.query_state_blocking():
+                        raise Exception(
+                            f"Dock sensor did not indicate docked state after docking on dock {self.name}.")
+
+            # Restore previous positions
+            if restore_pos:
+                pos[2] = self.safe_position_y
+                self.toolhead.move(pos, self.travel_speed)
+                self.restore_last_pos(restore_axes=True)
+            else:
+                # Cleanup current position from toolhead
+                self.toolhead.wait_moves()
+                self.toolhead.set_position(self.toolhead.get_position())
+            self.set_status(STATUS_DOCKED)
+        except Exception as e:
+            self.handle_exception(e, "docking", pause_on_error=self.exception_pause)
     
     def undock_toolhead(self, restore_pos=True):
-        # Check if modules are homed and ready for motion
-        self._enabled_check()
+        try:
+            # Check dock status and set to undocking state
+            if self.status not in STATUS_DOCKED:
+                raise Exception(
+                    f"Cannot undock toolhead, dock {self.name} status is '{self.status}', must be '{STATUS_DOCKED}'.")
+            self.set_status(STATUS_UNDOCKING)
 
-        # Save current positions for restore after operation
-        if restore_pos:
-            self._save_init_pos()
+            # Check if modules are homed and ready for motion
+            self._enabled_check()
 
-        # Check if toolhead is unmounted
-        if self.toolhead_detect:
-            if self.toolhead_detect.query_state_blocking():
-                raise self.printer.command_error(
-                    f"Toolhead still detected as mounted, cannot undock on dock {self.name}")
-        
-        # Check if custom undocking g-code is defined else perform standard undocking sequence
-        if self.undocking_gcode is not None:
-            try:
-                self.gcode.run_script_from_command(self.undocking_gcode.render() + "\nM400")
-            except Exception as e:
-                raise self.printer.command_error(f"Error executing undocking gcode: {e}")
-        else:
-            # Determine z-axis and undocking axis positions for undocking
-            if self.axis_mode == 'static' and self.docking_axis is False:
-                target_z_offset = self.docked_position_z - self.disengage_offset_z
-            else:
-                target_z_offset = self.docked_offset_z - self.disengage_offset_z
-            movepos_z = self._determine_movepos_z(target_z_offset)
-            if movepos_z is [None, None]:
-                raise self.printer.command_error(
-                    f"Cannot achieve docked offset z={target_z_offset}mm with current positions")
+            # Save current positions for restore after operation
+            if restore_pos:
+                self.save_init_pos()
+
+            # Check if toolhead is unmounted
+            if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                if self.toolhead_detect_shuttle.query_state_blocking():
+                    raise Exception(
+                        f"Toolhead still detected as mounted, cannot undock on dock {self.name}.")
             
-            # Get current toolhead position
-            pos = self.toolhead.get_position()
+            # Check if custom undocking g-code is defined else perform standard undocking sequence
+            if self.undocking_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.undocking_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Error executing undocking gcode: {e}")
+            else:
+                # Determine z-axis and undocking axis positions for undocking
+                if self.axis_mode == 'static' and self.docking_axis is False:
+                    target_z_offset = self.docked_position_z - self.disengage_offset_z
+                else:
+                    target_z_offset = self.docked_offset_z - self.disengage_offset_z
+                movepos_z = self._determine_movepos_z(target_z_offset)
+                if movepos_z is [None, None]:
+                    raise Exception(
+                        f"Cannot achieve docked offset z={target_z_offset}mm with current positions.")
+                
+                # Get current toolhead position
+                pos = self.toolhead.get_position()
 
-            # Move z-axis and possibly docking axis to desired height (slightly above dock)
-            if movepos_z[1] is not None:
-                speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
-                self.docking_axis.stepper.do_move(
-                    movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
-                )
-            if movepos_z[0] is not None:
-                pos[2] = movepos_z[0]
-                self.toolhead.move(pos, self.travel_speed)
-            self.toolhead.wait_moves()
-
-            # Move to safe xy position in front of dock
-            pos[0] = self.docked_position_x
-            pos[1] = self.docked_position_y + self.disengage_offset_y
-            self.toolhead.move(pos, self.travel_speed)
-
-            # Advance into dock position
-            pos[1] = self.docked_position_y
-            self.toolhead.move(pos, self.engage_speed)
-
-            # Raise to docked height
-            pos[2] += self.disengage_offset_z
-            self.toolhead.move(pos, self.engage_speed)
-
-            # Slide out of dock
-            pos[1] = self.docked_position_y + self.slide_distance_y
-            self.toolhead.move(pos, self.docking_speed)
-
-            # Raise to safe height
-            pos[2] += self.safe_offset_z
-            self.toolhead.move(pos, self.docking_speed)
-
-            # Move to safe xy position in front of dock
-            pos[1] = self.safe_position_y
-            self.toolhead.move(pos, self.travel_speed)
-        
-            # Verify that toolhead is now mounted
-            if self.toolhead_detect:
+                # Move z-axis and possibly docking axis to desired height (slightly above dock)
+                if movepos_z[1] is not None:
+                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    self.docking_axis.stepper.do_move(
+                        movepos_z[1], speed, self.docking_axis.stepper.accel, sync=False if self.axis_mode == 'balanced' else True
+                    )
+                if movepos_z[0] is not None:
+                    pos[2] = movepos_z[0]
+                    self.toolhead.move(pos, self.travel_speed)
                 self.toolhead.wait_moves()
-                if not self.toolhead_detect.query_state_blocking():
-                    raise self.printer.command_error(
-                        f"Toolhead not detected as mounted after undocking on dock {self.name}")
 
-        # Restore previous positions
-        if restore_pos:
-            self._restore_last_pos(restore_axes=True)
-        else:
-            # Cleanup current position from toolhead
-            self.toolhead.wait_moves()
-            self.toolhead.set_position(self.toolhead.get_position())
+                # Move to safe xy position in front of dock
+                pos[0] = self.docked_position_x
+                pos[1] = self.docked_position_y + self.disengage_offset_y
+                self.toolhead.move(pos, self.travel_speed)
 
-    def _save_init_pos(self):
+                # Advance into dock position
+                pos[1] = self.docked_position_y
+                self.toolhead.move(pos, self.engage_speed)
+
+                # Raise to docked height
+                pos[2] += self.disengage_offset_z
+                self.toolhead.move(pos, self.engage_speed)
+
+                # Slide out of dock
+                pos[1] = self.docked_position_y + self.slide_distance_y
+                self.toolhead.move(pos, self.docking_speed)
+
+                # Raise to safe height
+                pos[2] += self.safe_offset_z
+                self.toolhead.move(pos, self.docking_speed)
+
+                # Move to safe xy position in front of dock
+                pos[1] = self.safe_position_y
+                self.toolhead.move(pos, self.travel_speed)
+            
+                # Verify that toolhead is now mounted
+                if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
+                    self.toolhead.wait_moves()
+                    if not self.toolhead_detect_shuttle.query_state_blocking():
+                        raise Exception(
+                            f"Toolhead not detected as mounted after undocking on dock {self.name}.")
+
+                # Verify dock sensor if configured
+                if self.toolhead_detect_dock and self.toolhead_detect_dock.get_enabled():
+                    if self.toolhead_detect_dock.query_state_blocking():
+                        raise Exception(
+                            f"Dock sensor still indicated docked state after undocking on dock {self.name}.")
+
+            # Restore previous positions
+            if restore_pos:
+                self.restore_last_pos(restore_axes=True)
+            else:
+                # Cleanup current position from toolhead
+                self.toolhead.wait_moves()
+                self.toolhead.set_position(self.toolhead.get_position())
+            self.set_status(STATUS_ENGAGED)
+        except Exception as e:
+            self.handle_exception(e, "undocking", pause_on_error=self.exception_pause)
+
+    def save_init_pos(self):
         # Save current toolhead and docking_axis positions for restore after operation
         self.last_toolhead_pos = self.toolhead.get_position()
         if self.docking_axis:
             self.last_docking_axis_pos = self.docking_axis.get_position()
     
-    def _restore_last_pos(self, restore_axes=False):
-        # Ensure all moves are done before restoring and cleanup position from toolhead
-        self.toolhead.wait_moves()
-        self.toolhead.set_position(self.toolhead.get_position())
+    def restore_last_pos(self, restore_axes=False):
+        try:
+            # Ensure all moves are done before restoring and cleanup position from toolhead
+            self.toolhead.wait_moves()
+            self.toolhead.set_position(self.toolhead.get_position())
 
-        # Restore requested axes to last position
-        if restore_axes is False:
-            return
-        elif restore_axes is True:
-            restore_axes = self.restore_axes
+            # Restore requested axes to last position
+            if restore_axes is False:
+                return
+            elif restore_axes is True:
+                restore_axes = self.restore_axes
+            
+            if self.last_toolhead_pos is None:
+                    raise self.printer.command_error(
+                        f"Cannot restore toolhead position, no saved position found.")
         
-        if self.last_toolhead_pos is None:
-                raise self.printer.command_error(
-                    f"Cannot restore toolhead position, no saved position found")
-    
-        if self.docking_axis:
-            if self.last_docking_axis_pos is None:
-                raise self.printer.command_error(
-                    f"Cannot restore docking axis position, no saved position found")
+            if self.docking_axis:
+                if self.last_docking_axis_pos is None:
+                    raise self.printer.command_error(
+                        f"Cannot restore docking axis position, no saved position found.")
 
-        for axis_group in restore_axes:
-            axes = axis_group.split()
-            if 'docking_axis' in axes and self.docking_axis:
-                speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
-                self.docking_axis.stepper.do_move(
-                    self.last_docking_axis_pos, speed, 
-                    self.docking_axis.stepper.accel, sync=False
-                )
-            pos = self.toolhead.get_position()
-            if 'x' in axes:
-                pos[0] = self.last_toolhead_pos[0]
-            if 'y' in axes:
-                pos[1] = self.last_toolhead_pos[1]
-            if 'z' in axes:
-                pos[2] = self.last_toolhead_pos[2]
-            self.toolhead.move(pos, self.travel_speed)
-            if 'docking_axis' in axes and self.docking_axis:
-                self.toolhead.wait_moves()
-                
-        # Set init positions to None
-        self.toolhead.wait_moves()
-        self.toolhead.set_position(self.toolhead.get_position()) # Cleanup
-        self.last_toolhead_pos = None
-        self.last_docking_axis_pos = None
+            for axis_group in restore_axes:
+                axes = axis_group.split()
+                if 'docking_axis' in axes and self.docking_axis:
+                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    self.docking_axis.stepper.do_move(
+                        self.last_docking_axis_pos, speed, 
+                        self.docking_axis.stepper.accel, sync=False
+                    )
+                pos = self.toolhead.get_position()
+                if 'x' in axes:
+                    pos[0] = self.last_toolhead_pos[0]
+                if 'y' in axes:
+                    pos[1] = self.last_toolhead_pos[1]
+                if 'z' in axes:
+                    pos[2] = self.last_toolhead_pos[2]
+                self.toolhead.move(pos, self.travel_speed)
+                if 'docking_axis' in axes and self.docking_axis:
+                    self.toolhead.wait_moves()
+                    
+            # Set init positions to None
+            self.toolhead.wait_moves()
+            self.toolhead.set_position(self.toolhead.get_position()) # Cleanup
+            self.last_toolhead_pos = None
+            self.last_docking_axis_pos = None
+        except Exception as e:
+            self.handle_exception(e, "restoring position", pause_on_error=self.exception_pause)
 
     def _enabled_check(self):
         curtime = self.reactor.monotonic()
@@ -820,101 +943,111 @@ class DockUnit:
             # Check if docking axis is homed (also means enabled)
             if not self.docking_axis.get_status(curtime)['homed']:
                 raise self.printer.command_error(
-                    f"Docking axis not homed, please home before performing motions")
+                    f"Docking axis not homed, please home before performing motions.")
         if 'xyz' not in self.toolhead.get_kinematics().get_status(curtime)['homed_axes']:
             raise self.printer.command_error(
                 f"Toolhead not homed, please home before performing motions")
     
     def _determine_movepos_z(self, target_z_offset):
-        # Get current toolhead position
-        curpos = self.toolhead.get_position()
+        try:
+            # Get current toolhead position
+            curpos = self.toolhead.get_position()
 
-        # Check movepos z based on axis mode and target offset
-        toolhead_max_z = self.toolhead.get_kinematics().axes_max[2]
-        toolhead_min_z = self.toolhead.get_kinematics().axes_min[2]
-        if self.docking_axis:
-            docking_axis_max_z = self.docking_axis.stepper.pos_max
-            docking_axis_min_z = self.docking_axis.stepper.pos_min
-        
-        if self.axis_mode == 'static':
-            # Only toolhead moves, docking axis is static
+            # Check movepos z based on axis mode and target offset
+            toolhead_max_z = self.toolhead.get_kinematics().axes_max[2]
+            toolhead_min_z = self.toolhead.get_kinematics().axes_min[2]
             if self.docking_axis:
-                toolhead_movepos_z = self.docking_axis.get_position() + target_z_offset
+                docking_axis_max_z = self.docking_axis.stepper.pos_max
+                docking_axis_min_z = self.docking_axis.stepper.pos_min
+            
+            if self.axis_mode == 'static':
+                # Only toolhead moves, docking axis is static
+                if self.docking_axis:
+                    toolhead_movepos_z = self.docking_axis.get_position() + target_z_offset
+                else:
+                    toolhead_movepos_z = self.docked_position_z + target_z_offset
+                if toolhead_movepos_z > toolhead_max_z or toolhead_movepos_z < toolhead_min_z:
+                    raise Exception(
+                        f"Required toolhead Z position {toolhead_movepos_z} out of bounds.")
+                logging.info(f"Determined cut movepos_z: {toolhead_movepos_z}")
+                movepos = [toolhead_movepos_z, None]
+                return movepos
             else:
-                toolhead_movepos_z = self.docked_position_z + target_z_offset
-            if toolhead_movepos_z > toolhead_max_z or toolhead_movepos_z < toolhead_min_z:
-                raise self.printer.command_error(
-                    f"Required toolhead Z position {toolhead_movepos_z} out of bounds")
-            logging.info(f"Determined cut movepos_z: {toolhead_movepos_z}")
-            movepos = [toolhead_movepos_z, None]
-            return movepos
-        else:
-            toolhead_pos_z = self.toolhead.get_position()[2]
-            docking_axis_pos_z = self.docking_axis.get_position()
-            logging.info(f"Current positions: toolhead Z {toolhead_pos_z}, docking axis Z {docking_axis_pos_z}")
-            logging.info(f"Target offset z: {target_z_offset}")
-            if self.axis_mode == 'balanced':
-                # Split the difference equally
-                delta_z = (docking_axis_pos_z - toolhead_pos_z) + target_z_offset
-                toolhead_movepos_z = toolhead_pos_z + (delta_z / 2.)
-                docking_axis_movepos_z = docking_axis_pos_z - (delta_z / 2.)                                    
-            elif self.axis_mode == 'minimize_z':
-                # Minimize toolhead movement, docking axis does most of the work
-                docking_axis_movepos_z = toolhead_pos_z + target_z_offset
-                toolhead_movepos_z = toolhead_pos_z
-        
-        logging.info(f"Initial calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
-        
-        # Correct for axes bounds if needed
-        for _ in range(2):
-            # Check 1: Toolhead may never move below current position
-            if toolhead_movepos_z < curpos[2]:
-                toolhead_movepos_z = curpos[2]
-                docking_axis_movepos_z = toolhead_movepos_z - target_z_offset
+                toolhead_pos_z = self.toolhead.get_position()[2]
+                docking_axis_pos_z = self.docking_axis.get_position()
+                logging.info(f"Current positions: toolhead Z {toolhead_pos_z}, docking axis Z {docking_axis_pos_z}")
+                logging.info(f"Target offset z: {target_z_offset}")
+                if self.axis_mode == 'balanced':
+                    # Split the difference equally
+                    delta_z = (docking_axis_pos_z - toolhead_pos_z) + target_z_offset
+                    toolhead_movepos_z = toolhead_pos_z + (delta_z / 2.)
+                    docking_axis_movepos_z = docking_axis_pos_z - (delta_z / 2.)                                    
+                elif self.axis_mode == 'minimize_z':
+                    # Minimize toolhead movement, docking axis does most of the work
+                    docking_axis_movepos_z = toolhead_pos_z + target_z_offset
+                    toolhead_movepos_z = toolhead_pos_z
             
-            # Check 2: Toolhead may never move above max position
-            elif toolhead_movepos_z > toolhead_max_z:
-                toolhead_movepos_z = toolhead_max_z
-                docking_axis_movepos_z = toolhead_movepos_z - target_z_offset
+            logging.info(f"Initial calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
+            
+            # Correct for axes bounds if needed
+            for _ in range(2):
+                # Check 1: Toolhead may never move below current position
+                if toolhead_movepos_z < curpos[2]:
+                    toolhead_movepos_z = curpos[2]
+                    docking_axis_movepos_z = toolhead_movepos_z - target_z_offset
+                
+                # Check 2: Toolhead may never move above max position
+                elif toolhead_movepos_z > toolhead_max_z:
+                    toolhead_movepos_z = toolhead_max_z
+                    docking_axis_movepos_z = toolhead_movepos_z - target_z_offset
 
-            # Check 3: Docking axis may never move below min position
-            if docking_axis_movepos_z < docking_axis_min_z:
-                docking_axis_movepos_z = docking_axis_min_z
-                toolhead_movepos_z = docking_axis_movepos_z + target_z_offset
+                # Check 3: Docking axis may never move below min position
+                if docking_axis_movepos_z < docking_axis_min_z:
+                    docking_axis_movepos_z = docking_axis_min_z
+                    toolhead_movepos_z = docking_axis_movepos_z + target_z_offset
+                
+                # Check 4: Docking axis may never move above max position
+                elif docking_axis_movepos_z > docking_axis_max_z:
+                    docking_axis_movepos_z = docking_axis_max_z
+                    toolhead_movepos_z = docking_axis_movepos_z + target_z_offset
             
-            # Check 4: Docking axis may never move above max position
-            elif docking_axis_movepos_z > docking_axis_max_z:
-                docking_axis_movepos_z = docking_axis_max_z
-                toolhead_movepos_z = docking_axis_movepos_z + target_z_offset
-        
-        # Final validation - if still out of bounds, it's impossible
-        if (toolhead_movepos_z > toolhead_max_z or 
-            toolhead_movepos_z < toolhead_min_z or
-            toolhead_movepos_z < toolhead_pos_z):
-            raise self.printer.command_error(
-                f"Cannot achieve {target_z_offset:.2f}mm offset: "
-                f"toolhead Z would be {toolhead_movepos_z:.2f}mm "
-                f"(limits: {toolhead_min_z:.2f} to {toolhead_max_z:.2f}mm, current: {toolhead_pos_z:.2f}mm)"
-            )
-        
-        if (docking_axis_movepos_z > docking_axis_max_z or 
-            docking_axis_movepos_z < docking_axis_min_z):
-            raise self.printer.command_error(
-                f"Cannot achieve {target_z_offset:.2f}mm offset: "
-                f"docking axis would be {docking_axis_movepos_z:.2f}mm "
-                f"(limits: {docking_axis_min_z:.2f} to {docking_axis_max_z:.2f}mm)"
-            )
-        
-        logging.info(f"Final calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
-        
-        movepos = [toolhead_movepos_z, docking_axis_movepos_z]
-        return movepos
+            # Final validation - if still out of bounds, it's impossible
+            if (toolhead_movepos_z > toolhead_max_z or 
+                toolhead_movepos_z < toolhead_min_z or
+                toolhead_movepos_z < toolhead_pos_z):
+                raise Exception(
+                    f"Cannot achieve {target_z_offset:.2f}mm offset: "
+                    f"toolhead Z would be {toolhead_movepos_z:.2f}mm "
+                    f"(limits: {toolhead_min_z:.2f} to {toolhead_max_z:.2f}mm, current: {toolhead_pos_z:.2f}mm)"
+                )
+            
+            if (docking_axis_movepos_z > docking_axis_max_z or 
+                docking_axis_movepos_z < docking_axis_min_z):
+                raise Exception(
+                    f"Cannot achieve {target_z_offset:.2f}mm offset: "
+                    f"docking axis would be {docking_axis_movepos_z:.2f}mm "
+                    f"(limits: {docking_axis_min_z:.2f} to {docking_axis_max_z:.2f}mm)"
+                )
+            
+            logging.info(f"Final calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
+            
+            movepos = [toolhead_movepos_z, docking_axis_movepos_z]
+            return movepos
+
+        except Exception as e:
+            self.handle_exception(e, "determining movepos z", pause_on_error=self.exception_pause)
     
     def get_extruder_name(self):
         return self.extruder_name
     
     def get_name(self):
         return self.name
+    
+    def get_status(self, eventtime=None):
+        return{
+            'status': self.status,
+            'axis_mode': self.axis_mode
+        }
 
 def load_config_prefix(config):
     return DockUnit(config)

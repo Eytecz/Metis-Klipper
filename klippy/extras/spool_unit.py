@@ -102,10 +102,10 @@ class StepperHelper:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         
         # Optional config sections
-        self.load_speed = config.getfloat('load_speed', 100.0, minval=1.0)
-        self.unload_speed = config.getfloat('unload_speed', 100.0, minval=1.0)
+        self.load_speed = config.getfloat('load_speed', 150.0, minval=1.0)
+        self.unload_speed = config.getfloat('unload_speed', 150.0, minval=1.0)
         self.homing_speed = config.getfloat('homing_speed', 50.0, minval=1.0)
-        self.accel = config.getfloat('accel', 1000.0, minval=1.0)
+        self.accel = config.getfloat('accel', 500.0, minval=1.0)
 
     def handle_connect(self):
         stepper_name = self.config.get('stepper', None)
@@ -146,8 +146,10 @@ class StepperHelper:
             return None
         return bool(state)
 
-    def do_homing_move(self, movepos, triggered):
-        self.stepper.do_homing_move(movepos, self.homing_speed, self.accel, triggered, check_trigger=True)
+    def do_homing_move(self, movepos, triggered, homing_speed=None):
+        if homing_speed is None:
+            homing_speed = self.homing_speed
+        self.stepper.do_homing_move(movepos, homing_speed, self.accel, triggered, check_trigger=True)
     
     def do_move(self, movepos):
         if movepos >=0:
@@ -450,6 +452,10 @@ class SpoolUnit:
         # Set status to ERROR
         self.set_status(STATUS_ERROR)
 
+        # Ensure all moves are done and update position
+        self.toolhead.wait_moves()
+        self.toolhead.set_position(self.toolhead.get_position())
+
         # Check printer status and pause if required
         if pause_on_error:
             idle_timeout = self.printer.lookup_object('idle_timeout')
@@ -463,20 +469,19 @@ class SpoolUnit:
                     self.reactor.pause(self.reactor.monotonic() + 0.5)
                 self._exec_gcode(pause_prefix, self.exception_gcode)
                 msg = (
-                    f"<span style='color: #FF4444;'>{str(exception)}</span>\n"
-                    f"<span style='color: #FF4444;'>Printing has been paused. Please resolve the issue before resuming.</span>"
+                    f"{str(exception)} Printing has been paused. Please resolve the issue before resuming."
                 )
-                self.gcode.respond_info(msg)
-                logging.info(msg)
-                return self.reactor.NEVER if context == "initializing" else False
+                if context == "initializing":
+                    return self.reactor.NEVER
+                else:
+                    raise Exception(msg)
         
         msg = (
-            f"<span style='color: #FF4444;'>{str(exception)}</span>\n"
-            f"<span style='color: #FF4444;'>Printing has not been paused. Please resolve the issue before continuing.</span>"
-        )
-        self.gcode.respond_info(msg)
-        #logging.info(msg)
-        return self.reactor.NEVER if context == "initializing" else None
+            f"{str(exception)} Printing has not been paused. Please resolve the issue before continuing.")
+        if context == "initializing":
+            return self.reactor.NEVER
+        else:
+            raise Exception(msg)
 
     def cmd_SET_STATUS(self, gcmd):
         self.set_status(gcmd.get('STATUS'))
@@ -537,19 +542,19 @@ class SpoolUnit:
         try:
             self.spool_load()
         except Exception as e:
-            return self.handle_exception(e, "spool load", pause_on_error=True)
+            self.handle_exception(e, "spool load", pause_on_error=True)
 
     def cmd_SPOOL_UNLOAD(self, gcmd):
         try:
             self.spool_unload()
         except Exception as e:
-            return self.handle_exception(e, "spool unload", pause_on_error=True)
+            self.handle_exception(e, "spool unload", pause_on_error=True)
 
     def cmd_SPOOL_EJECT(self, gcmd):
         try:
             self.spool_eject()
         except Exception as e:
-            return self.handle_exception(e, "spool eject", pause_on_error=True)
+            self.handle_exception(e, "spool eject", pause_on_error=True)
         
     def cmd_CLEAR_ERROR(self, gcmd):
         if self.status != STATUS_ERROR:
@@ -578,10 +583,10 @@ class SpoolUnit:
         # Catch inconsistent sensor states
         if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == False:
             e = f"Inconsistent sensor states detected during initialization for spool unit {self.name}."
-            return self.handle_exception(e, "initializing", False)
+            self.handle_exception(e, "initializing", False)
         elif self.sensor_states.get('hub_sensor') == False and self.sensor_states.get('toolhead_sensor') == True:
             e = f"Inconsistent sensor states detected during initialization for spool unit {self.name}."
-            return self.handle_exception(e, "initializing", False)
+            self.handle_exception(e, "initializing", False)
         
         # Determine status based on sensor states
         if self.sensor_states.get('pre_gate_sensor') == False:
@@ -599,7 +604,7 @@ class SpoolUnit:
                     self.stepper_helper.do_set_position(0.)
                     self.set_status(STATUS_IDLE)
                 except Exception as e:
-                    return self.handle_exception(e, "initializing", pause_on_error=False) 
+                    self.handle_exception(e, "initializing", pause_on_error=False) 
             else:
                 if self.sensor_states.get('hub_sensor') == True and self.sensor_states.get('toolhead_sensor') == True:
                     try:
@@ -622,7 +627,7 @@ class SpoolUnit:
                             self.sync_to_extruder(True)
                             self.set_status(STATUS_LOADED)
                     except Exception as e:
-                        return self.handle_exception(e, "initializing", pause_on_error=False)
+                        self.handle_exception(e, "initializing", pause_on_error=False)
                 else:
                     self.set_status(STATUS_ERROR)
         return self.reactor.NEVER        
@@ -632,7 +637,7 @@ class SpoolUnit:
         try:
             self.calibrate_bowden_length()
         except Exception as e:
-            return self.handle_exception(e, "calibrate bowden length", pause_on_error=True)
+            self.handle_exception(e, "calibrate bowden length", pause_on_error=True)
 
     def calibrate_bowden_length(self):
         if self.status == STATUS_IDLE or self.status == STATUS_LOADED:
@@ -831,10 +836,10 @@ class SpoolUnit:
                 self.set_status(STATUS_IDLE)
 
             except Exception as e:
-                return self.handle_exception(e, "calibrate", pause_on_error=True)
+                self.handle_exception(e, "calibrate", pause_on_error=True)
         else:
             e = f"Spool unit {self.name} must be in IDLE or LOADED state to perform calibration"
-            return self.handle_exception(e, "calibrate", pause_on_error=True)
+            self.handle_exception(e, "calibrate", pause_on_error=True)
 
     def sync_to_extruder(self, state):
         if self.synced == state:
@@ -848,7 +853,7 @@ class SpoolUnit:
                 self.axis_sync.sync_stepper_to_extruder(self.stepper_name, None)
             self.synced = state
         except Exception as e:
-            return self.handle_exception(e, "sync_to_extruder", pause_on_error=True)
+            self.handle_exception(e, "sync_to_extruder", pause_on_error=True)
            
     def activate_extruder(self):
         if self.toolhead.get_extruder() == self.extruder:
@@ -902,7 +907,7 @@ class SpoolUnit:
                 movepos[3] -= 100.0     # Ideally get filament_cutter - end_of_bowden distance
                 self.toolhead.move(movepos, speed)
                 self.toolhead.wait_moves()
-                self.hbridge_motor.scheduled_motion(pwm_value=0)
+                #self.hbridge_motor.scheduled_motion(pwm_value=0)
                 self.toolhead.set_position(self.toolhead.get_position()) # Cleanup position
                 self.restore_extruder()
                 self.sync_to_extruder(False)
@@ -911,11 +916,10 @@ class SpoolUnit:
                 else:
                     movepos = -2000.0
                 self.stepper_helper.do_set_position(0.)
-                self.hbridge_motor.scheduled_motion(pwm_value=-1.0) # Override interception
-                self.stepper_helper.do_homing_move(movepos=movepos, triggered=False)
+                self.stepper_helper.do_homing_move(movepos=movepos, triggered=False, homing_speed=self.stepper_helper.unload_speed)
                 movepos -= 10.0
                 self.stepper_helper.do_move(movepos)
-                self.hbridge_motor.scheduled_motion(pwm_value=0) # Override interception
+                self.hbridge_motor.scheduled_motion(pwm_value=-1.0, runtime=5.0) # Override interception
                 self.stepper_helper.do_set_position(0.)
                 self.filament_hub.set_loaded_spool_unit(None)
 
@@ -936,10 +940,10 @@ class SpoolUnit:
                     self.set_status(STATUS_IDLE)
 
             except Exception as e:
-                return self.handle_exception(e, "spool_unload", pause_on_error=True)
+                self.handle_exception(e, "spool_unload", pause_on_error=True)
         else:
             e = f"Spool {self.name} is not in LOADED or ERROR state, cannot perform unload."
-            return self.handle_exception(e, "spool_unload", pause_on_error=True)
+            self.handle_exception(e, "spool_unload", pause_on_error=True)
     
     def spool_load(self):
         # Check if already loaded
@@ -964,7 +968,7 @@ class SpoolUnit:
                 self.activate_extruder()
                 self.check_set_extruder_temp(wait=True) # Ensure extruder is hot enough to allow motion
                 dist_max = (self.hub_toolhead_distance_max - self.hub_toolhead_distance_min +
-                             self.gear_entry_toolhead_distance) + 20.0
+                             self.gear_entry_toolhead_distance) + 100.0
                 speed = self.stepper_helper.load_speed
                 step_size = 1.0
                 dist = 0.0
@@ -1008,11 +1012,11 @@ class SpoolUnit:
                 self.set_status(STATUS_LOADED)
 
             except Exception as e:
-                return self.handle_exception(e, "spool_load", pause_on_error=True)
+                self.handle_exception(e, "spool_load", pause_on_error=True)
             
         else:
             e = f"Spool {self.name} is not in IDLE state, cannot perform load."
-            return self.handle_exception(e, "spool_load", pause_on_error=True)           
+            self.handle_exception(e, "spool_load", pause_on_error=True)           
 
     def spool_eject(self):
         if self.status in [STATUS_IDLE, STATUS_LOADED, STATUS_ERROR, STATUS_RUNOUT]:
@@ -1020,7 +1024,7 @@ class SpoolUnit:
                 try:
                     self.spool_unload()
                 except Exception as e:
-                    return self.handle_exception(e, "spool_eject", pause_on_error=True)
+                    self.handle_exception(e, "spool_eject", pause_on_error=True)
             try:
                 self.set_status(STATUS_EJECTING)
                 self.stepper_helper.do_set_position(0.)
@@ -1039,7 +1043,7 @@ class SpoolUnit:
                 self.hbridge_motor.scheduled_motion(pwm_value=-1.0, runtime=runtime) # Reverse spool to eject
 
             except Exception as e:
-                return self.handle_exception(e, "spool_eject", pause_on_error=True)
+                self.handle_exception(e, "spool_eject", pause_on_error=True)
     
     def runout_event_handler(self, eventtime):
         if self.status == STATUS_EJECTING:
@@ -1049,6 +1053,9 @@ class SpoolUnit:
                 self.eject_timer = None
             self.set_status(STATUS_EMPTY)
         else:
+            # Check if this tool was actually loaded
+            if self.status != STATUS_LOADED:
+                return  # This is not the actual spool engaged on this extruder - ignore
             # Check printer state
             idle_timeout = self.printer.lookup_object('idle_timeout')
             is_printing = idle_timeout.get_status(self.reactor.monotonic())['state'] == "Printing"
@@ -1073,9 +1080,9 @@ class SpoolUnit:
 
     def _exec_gcode(self, prefix, template):
         try:
-            self.gcode.run_script(prefix + template.render() + "\nM400")
+            self.gcode.run_script_from_command(prefix + template.render() + "\nM400")
         except Exception as e:
-            return self.handle_exception(e, "_exec_gcode", pause_on_error=True)
+            self.handle_exception(e, "_exec_gcode", pause_on_error=True)
             
     def motion_extraction(self, *args):
         print_time = args[1]
@@ -1266,7 +1273,7 @@ class SpoolUnit:
 
     def get_extruder_name(self):
         return self.extruder_name
-
+    
     def get_status(self, eventtime):
         return {
             'status': self.status,

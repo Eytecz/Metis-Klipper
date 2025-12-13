@@ -31,7 +31,9 @@ class ToolheadDetect:
         self.pending_state = None
         self.confirm_timer = None
         self.lost_timer = None
-        self.enabled = False
+        self.enabled = True
+        self.action_enabled = False
+        self.callbacks = []
 
         # Register required objects
         buttons = self.printer.load_object(config, 'buttons')
@@ -46,6 +48,9 @@ class ToolheadDetect:
         self.gcode.register_mux_command('ENABLE_TOOLHEAD_DETECT', 'TOOLHEAD', self.name,
                                         self.cmd_ENABLE_TOOLHEAD_DETECT,
                                         desc="Enable toolhead engagement detection")
+        self.gcode.register_mux_command('ENABLE_ACTION_TOOLHEAD_DETECT', 'TOOLHEAD', self.name,
+                                        self.cmd_ENABLE_ACTION_TOOLHEAD_DETECT,
+                                        desc="Enable action on toolhead engagement detection")
 
     def handle_ready(self):
         pass
@@ -93,15 +98,24 @@ class ToolheadDetect:
     def _engage_event_handler(self):
         if not self.enabled:
             return
+        for callback in self.callbacks:
+            callback(True)
+        if not self.action_enabled:
+            return
         # Cancel lost timer if running
         if self.lost_timer is not None:
             self.reactor.unregister_timer(self.lost_timer)
             self.lost_timer = None
             if self.state_logging:
                 logging.info(f"Toolhead {self.name} re-engaged, cancelling lost timer")
+        
 
     def _disengage_event_handler(self):
         if not self.enabled:
+            return
+        for callback in self.callbacks:
+            callback(False)
+        if not self.action_enabled:
             return
         if self.pause_on_lost or self.lost_gcode is not None:
             # Check printer state, return if not printing
@@ -163,6 +177,14 @@ class ToolheadDetect:
         self.enable(enable)
         gcmd.respond_info(f"Toolhead {self.name} detection {'enabled' if enable else 'disabled'}")
 
+    def cmd_ENABLE_ACTION_TOOLHEAD_DETECT(self, gcmd):
+        enable = bool(gcmd.get_int('ENABLE', 1))
+        self.action_enabled = enable
+        gcmd.respond_info(f"Toolhead {self.name} detection action {'enabled' if enable else 'disabled'}")
+
+    def register_callback(self, callback):
+        self.callbacks.append(callback)
+
     def enable(self, state=True):
         if self.enabled == state:
             return
@@ -194,6 +216,9 @@ class ToolheadDetect:
 
     def get_enabled(self):
         return self.enabled
+    
+    def get_action_enabled(self):
+        return self.action_enabled
 
     def get_name(self):
         return self.name
