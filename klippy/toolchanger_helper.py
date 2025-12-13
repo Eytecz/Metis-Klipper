@@ -149,6 +149,7 @@ class ToolchangerHelper:
         if tool_state == 'loaded' and dock_state == 'engaged': # Already usable
             logging.info(f"Tool {tool_name} already loaded and docked, no action required")
             return
+        
         elif tool_state == 'loaded' and dock_state == 'docked': # Change toolhead
             logging.info(f"Changing to tool {tool_name}")
             tool['dock_unit'].save_init_pos()
@@ -163,15 +164,13 @@ class ToolchangerHelper:
                     if active_dock.filament_sensor.runout_helper.filament_present:
                         active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
+            tool['dock_unit'].undock_toolhead(restore_pos=True)
             if self.post_undock_gcode is not None:
-                tool['dock_unit'].undock_toolhead(restore_pos=False)
                 try:
                     self.gcode.run_script_from_command(self.post_undock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-undock gcode failed: {str(e)}")
-                tool['dock_unit'].restore_last_pos(restore_axes=True)
-            else:
-                tool['dock_unit'].undock_toolhead(restore_pos=True)
+                
         elif tool_state == 'idle' and dock_state == 'engaged': # Change filament
             logging.info(f"Changing filament to tool {tool_name}")
             active_dock = self.get_active_dock()
@@ -184,6 +183,7 @@ class ToolchangerHelper:
                     self.gcode.run_script_from_command(self.post_change_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-change gcode failed: {str(e)}")
+                
         elif tool_state == 'idle' and dock_state == 'docked': # Replace toolhead and filament
             logging.info(f"Replacing toolhead and filament to tool {tool_name}")
             tool['spool_unit'].spool_load()
@@ -199,15 +199,13 @@ class ToolchangerHelper:
                     if active_dock.filament_sensor.runout_helper.filament_present:
                         active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
+            tool['dock_unit'].undock_toolhead(restore_pos=True)
             if self.post_replace_gcode is not None:
-                tool['dock_unit'].undock_toolhead(restore_pos=False)
                 try:
                     self.gcode.run_script_from_command(self.post_replace_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-replace gcode failed: {str(e)}")
-                tool['dock_unit'].restore_last_pos(restore_axes=True)
-            else:
-                tool['dock_unit'].undock_toolhead(restore_pos=True)
+        
 
     def cmd_INIT_DOCKS(self, gcmd):
         for _, dock_unit in self.dock_units.items():

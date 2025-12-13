@@ -513,6 +513,7 @@ class DockUnit:
     def cmd_CUT_FILAMENT(self, gcmd):
         restore_pos = gcmd.get_int('RESTORE_POS', 1)
         try:
+            self.save_init_pos()
             self.cut_filament(bool(restore_pos))
         except Exception as e:
             raise gcmd.error(f"Error cutting filament: {e}")
@@ -553,10 +554,6 @@ class DockUnit:
 
             # Check if modules are homed and ready for motion
             self._enabled_check()
-            
-            # Save current positions for restore after operation
-            if restore_pos:
-                self.save_init_pos()
 
             # Check if filament cutter is configured
             if not self.filament_cutter:
@@ -683,10 +680,6 @@ class DockUnit:
             self.set_status(STATUS_DOCKING)
             # Check if modules are homed and ready for motion
             self._enabled_check()
-
-            # Save current positions for restore after operation
-            if restore_pos:
-                self.save_init_pos()
             
             # Check if toolhead is mounted
             if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
@@ -792,10 +785,6 @@ class DockUnit:
 
             # Check if modules are homed and ready for motion
             self._enabled_check()
-
-            # Save current positions for restore after operation
-            if restore_pos:
-                self.save_init_pos()
 
             # Check if toolhead is unmounted
             if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
