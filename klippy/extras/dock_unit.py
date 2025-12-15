@@ -268,6 +268,7 @@ class DockUnit:
         
         # Cutting sequence parameters
         self.filament_cutter = config.getboolean('filament_cutter', False)
+        self.toolhead_sensor_cutter_distance = config.getfloat('toolhead_sensor_cutter_distance', None)
         self.cutter_position_x = config.getfloat(
             'cutter_position_x', None, minval=0.)
         self.cutter_position_y = config.getfloat( 
@@ -276,7 +277,6 @@ class DockUnit:
             'cutter_offset_z', None)
         self.cutter_retract_y = config.getfloat(
             'cutter_retract_y', None)
-        
         self.cutting_current = config.getfloat(
             'cutting_current', None, minval=0.)
         self.current_helper = None
@@ -607,6 +607,82 @@ class DockUnit:
         self.printer.send_event("extruder:activate_extruder")
         self.toolhead.wait_moves()
 
+    def calibrate_cutter_position(self):
+        if self.status not in [STATUS_ENGAGED]:
+            raise Exception("Cutter position calibration can only be performed when dock unit is ENGAGED")
+        try:
+            # Check if cutter is available
+            if not self.filament_cutter:
+                raise Exception("Cutter position calibration requires a filament cutter to configured in the dock unit")
+
+            # Check if this dock/toolhead has a loaded spool unit
+            spool_unit = None
+            for spool_unit in self.printer.lookup_objects('spool_unit'):
+                if spool_unit[1].get_extruder_name == self.extruder_name:
+                    if spool_unit[1].get_status(self.reactor.monotonic())['status'] == 'loaded':
+                        spool_unit = spool_unit[1]
+                        break
+            if spool_unit is None:
+                raise Exception("Cutter position calibration requires an active spool unit loaded on the dock's extruder")
+            
+            # Update spool unit state
+            spool_unit.set_state('calibrating')
+
+            # Ensure axes are homed
+            self.enabled_check()
+
+            # Prepare extruder
+            spool_unit.sync_to_extruder(True)
+            spool_unit.activate_extruder()
+            spool_unit.check_set_extruder_temp(wait=True)
+
+            # Purge filament to ensure it's past the cutter
+            pos = self.toolhead.get_position()
+            pos[3] += 50.
+            extrude_speed = 5.0
+            self.toolhead.move(pos, extrude_speed)
+            self.toolhead.wait_moves()
+            
+            # Perform cut
+            self.cut_filament(restore_pos=True)
+
+            # Iteratively retract filament until toolhead sensor is triggered
+            speed = spool_unit.stepper_helper.homing_speed
+            step_size = 0.2
+            dist_max = 50.
+            dist = 0.
+            pos[3] -= step_size
+            while bool(spool_unit.toolhead_sensor.runout_helper.filament_present):
+                self.toolhead.move(pos, speed)
+                self.toolhead.wait_moves()
+                dist += step_size
+                if dist >= dist_max:
+                    raise Exception("Toolhead sensor not triggered within expected range during cutter position calibration.")
+                pos[3] -= step_size
+            self.toolhead_sensor_cutter_distance = dist
+            pos[3] += self.toolhead_sensor_cutter_distance # Move back to starting position
+            self.toolhead.move()
+
+            # Restore extruder state
+            spool_unit.restore_extruder()
+
+            # Restore spool unit state
+            spool_unit.set_state('loaded')
+
+            # Save config values
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set(f'dock_unit {self.name}', 'toolhead_sensor_cutter_distance', f'{self.toolhead_sensor_cutter_distance:.3f}')
+
+            def format_macro(macro: str) -> str:
+                    return f'<a class="command">{macro}</a>'
+            
+            self.gcode.respond_info(
+                f"Cutter position calibration for extruder {self.extruder_name} completed successfully.\n"
+                f"Please use {format_macro(f'SAVE_CONFIG')} to save the calibration values."
+            )
+        except Exception as e:
+            raise Exception(f"Cutter position calibration failed: {e}")
+
     def cut_filament(self, restore_pos=True, restore_axes=None):
         if not self.enable_filament_cutter:
             logging.info(f"Filament cutter disabled for dock {self.name}, skipping cut.")
@@ -619,7 +695,7 @@ class DockUnit:
             self.set_status(STATUS_CUT_FILAMENT)
 
             # Check if modules are homed and ready for motion
-            self._enabled_check()
+            self.enabled_check()
 
             # Check if filament cutter is configured
             if not self.filament_cutter:
@@ -712,11 +788,8 @@ class DockUnit:
                 self.check_set_extruder_temp(wait=True)
 
                 # Release tension on blade so it can retract (temporarily bypass extrude check)
-                #extruder = self.printer.lookup_object(self.extruder_name)
-                #can_extrude_original = extruder.heater.can_extrude  # Save current value
                 try:
                     self.activate_extruder()
-                    #extruder.heater.can_extrude = True  # Override to allow movement
                     pos = self.toolhead.get_position()
                     pos[3] -= 2.0
                     self.toolhead.move(pos, 10.0)
@@ -724,8 +797,6 @@ class DockUnit:
                     self.toolhead.move(pos, 10.0)
                     self.toolhead.wait_moves()
                     self.restore_extruder()
-                # finally:
-                #     extruder.heater.can_extrude = can_extrude_original  # Always restore
                 except Exception as e:
                     raise Exception(f"Error retracting filament after cutting: {e}")
 
@@ -757,7 +828,7 @@ class DockUnit:
                     f"Cannot dock toolhead, dock {self.name} status is '{self.status}', must be '{STATUS_ENGAGED}'.")
             self.set_status(STATUS_DOCKING)
             # Check if modules are homed and ready for motion
-            self._enabled_check()
+            self.enabled_check()
             
             # Check if toolhead is mounted
             if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
@@ -870,7 +941,7 @@ class DockUnit:
             self.set_status(STATUS_UNDOCKING)
 
             # Check if modules are homed and ready for motion
-            self._enabled_check()
+            self.enabled_check()
 
             # Check if toolhead is unmounted
             if self.toolhead_detect_shuttle and self.toolhead_detect_shuttle.get_enabled():
@@ -983,6 +1054,20 @@ class DockUnit:
             self.restore_extruder()
         except Exception as e:
             self.handle_exception(e, "unretracting filament", pause_on_error=self.exception_pause)
+    
+    def finalize_load_to_cutter(self):
+        if self.toolhead_sensor_cutter_distance is None:
+            logging.info(f"No toolhead sensor to cutter distance calibrated for dock {self.name}, skipping finalize load to cutter")
+            return
+        try:
+            pos = self.toolhead.get_position()
+            pos[3] += self.toolhead_sensor_cutter_distance
+            speed = 5.
+            self.toolhead.move(pos, speed)
+            self.toolhead.wait_moves()
+            self.toolhead.set_position(self.toolhead.get_position())
+        except Exception as e:
+            self.handle_exception(e, "finalizing load to cutter", pause_on_error=self.exception_pause)
 
     def save_init_pos(self):
         # Save current toolhead and docking_axis positions for restore after operation
@@ -1004,15 +1089,14 @@ class DockUnit:
             else:
                 restore_axes = restore_axes
             
-            
             if self.last_toolhead_pos is None:
                     raise self.printer.command_error(
-                        f"Cannot restore toolhead position, no saved position found.")
+                        f"Cannot restore toolhead position, no saved position found")
         
             if self.docking_axis:
                 if self.last_docking_axis_pos is None:
                     raise self.printer.command_error(
-                        f"Cannot restore docking axis position, no saved position found.")
+                        f"Cannot restore docking axis position, no saved position found")
 
             for axis_group in restore_axes:
                 axes = axis_group.split()
@@ -1041,7 +1125,7 @@ class DockUnit:
         except Exception as e:
             self.handle_exception(e, "restoring position", pause_on_error=self.exception_pause)
 
-    def _enabled_check(self):
+    def enabled_check(self):
         curtime = self.reactor.monotonic()
         if self.docking_axis:
             # Check if docking axis is homed (also means enabled)

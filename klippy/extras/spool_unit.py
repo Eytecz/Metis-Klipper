@@ -212,7 +212,7 @@ class LEDHelper:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
     
     def handle_connect(self):
-        self._create_led_configs()   
+        self._create_led_configs()
     
     def _create_led_configs(self):
         configs = {}
@@ -318,7 +318,6 @@ class SpoolUnit:
             self.exception_gcode = gcode_macro.load_template(
                 config, 'exception_gcode', '')
         
-        
         self.vl6180_name = config.get('vl6180_sensor', None)
         if self.vl6180_name:
             self.vl6180_center_distance = config.getfloat('vl6180_center_distance', 125.0, minval=0.0)
@@ -334,8 +333,8 @@ class SpoolUnit:
 
         self.stepper_name = config.get('stepper', None)
         if self.stepper_name:
-            self.stepper_helper = StepperHelper(config, self)  
-
+            self.stepper_helper = StepperHelper(config, self)
+        
         # Material and spool properties for content estimation
         self.material_density = config.getfloat('material_density', 1.05, minval=0.1) 
         self.filament_diameter = config.getfloat('filament_diameter', 1.75, minval=0.1)
@@ -537,7 +536,6 @@ class SpoolUnit:
             f"  assist_threshold: {self.assist_threshold:.1f}mm"
         )
             
-
     def cmd_SPOOL_LOAD(self, gcmd):
         try:
             self.spool_load()
@@ -562,7 +560,6 @@ class SpoolUnit:
             return
         gcmd.respond_info(f'Clearing error state and re-initializing spool unit {self.name}.')
         self.initialize_spool_unit()
-        
 
     def set_status(self, status):
         if self.status == status:
@@ -631,7 +628,6 @@ class SpoolUnit:
                 else:
                     self.set_status(STATUS_ERROR)
         return self.reactor.NEVER        
-
     
     def cmd_CALIBRATE_BOWDEN_LENGTH(self, gcmd):
         try:

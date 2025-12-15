@@ -199,6 +199,7 @@ class ToolchangerHelper:
                     tool['dock_unit'].save_init_pos()
                     active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
+            tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
             if self.post_change_gcode is not None:
                 try:
@@ -209,6 +210,7 @@ class ToolchangerHelper:
         elif tool_state == 'idle' and dock_state == 'docked': # Replace toolhead and filament
             logging.info(f"Replacing toolhead and filament to tool {tool_name}")
             tool['spool_unit'].spool_load()
+            tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].save_init_pos()
             if self.pre_dock_gcode is not None:
                 try:
