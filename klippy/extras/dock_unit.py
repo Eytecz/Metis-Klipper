@@ -340,6 +340,9 @@ class DockUnit:
         self.gcode.register_mux_command('SET_CUTTER', 'DOCK', self.name,
                                         self.cmd_SET_CUTTER,
                                         desc="Enable/disable the filament cutter")
+        self.gcode.register_mux_command('CALIBRATE_CUTTER_POSITION', 'DOCK', self.name,
+                                        self.cmd_CALIBRATE_CUTTER_POSITION,
+                                        desc="Calibrate the cutter position based on toolhead sensor")
     
     def handle_connect(self):
         self.extruder = self.printer.lookup_object(self.extruder_name)
@@ -562,6 +565,12 @@ class DockUnit:
                 f"Invalid axis mode '{mode}', valid modes are: {', '.join(axis_modes.keys())}.")
         self.axis_mode = mode
         gcmd.respond_info(f"Dock {self.name} axis mode set to {self.axis_mode}.")
+    
+    def cmd_CALIBRATE_CUTTER_POSITION(self, gcmd):
+        try:
+            self.calibrate_cutter_position()
+        except Exception as e:
+            raise gcmd.error(f"Error calibrating cutter position: {e}")
 
     def check_set_extruder_temp(self, wait=False):
         logging.info(f"Checking extruder temperature for dock {self.name} before cutting filament.")
