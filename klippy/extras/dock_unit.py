@@ -960,8 +960,8 @@ class DockUnit:
 
     def retract_filament(self):
         try:
-            self.check_set_extruder_temp(wait=True)
             self.activate_extruder()
+            self.check_set_extruder_temp(wait=True)
             pos = self.toolhead.get_position()
             pos[3] -= self.retract_length
             self.toolhead.move(pos, self.retract_speed)
@@ -972,8 +972,8 @@ class DockUnit:
 
     def unretract_filament(self):
         try:
-            self.check_set_extruder_temp(wait=True)
             self.activate_extruder()
+            self.check_set_extruder_temp(wait=True)
             pos = self.toolhead.get_position()
             pos[3] += self.unretract_length
             self.toolhead.move(pos, self.unretract_speed)
