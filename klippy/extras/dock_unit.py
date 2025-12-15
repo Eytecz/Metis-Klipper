@@ -307,6 +307,8 @@ class DockUnit:
         self.led_ready = False
         self.previous_extruder = None
         self.enable_filament_cutter = True
+        self.last_toolhead_pos = None
+        self.last_docking_axis_pos = None
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
