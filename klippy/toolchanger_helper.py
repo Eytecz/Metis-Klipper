@@ -14,6 +14,8 @@ class ToolchangerHelper:
         
         # Read config
         self.docking_axis = config.getboolean('docking_axis', True)
+        self.restore_axes = config.getlist(
+            'restore_axes', ['y', 'x', 'z', 'docking_axis'])
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -21,11 +23,13 @@ class ToolchangerHelper:
         # Register g-code commands
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command('TOOL_REQUEST', self.cmd_TOOL_REQUEST,
-                                    desc="Request a tool change to the specified tool.")
+                                    desc="Request a tool change to the specified tool")
         self.gcode.register_command('INIT_DOCKS', self.cmd_INIT_DOCKS,
-                                    desc="Initialize all dock units.")
+                                    desc="Initialize all dock units")
+        self.gcode.register_command('SET_DOCKING_AXIS_MODE', self.cmd_SET_DOCKING_AXIS_MODE,
+                                    desc="Set docking axis mode")
         self.gcode.register_command('RESTORE_TOOLCHANGER', self.cmd_RESTORE_TOOLCHANGER,
-                                    desc="Restore toolchanger to ready state after error.")
+                                    desc="Restore toolchanger to ready state after error")
         
         # Optional gcodes
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -109,6 +113,19 @@ class ToolchangerHelper:
                 logging.error(f"Failed to run UNSELECT_TOOL script: {str(unselect_error)}")
             raise gcmd.error("Tool request failed: %s" % str(e))
 
+    def cmd_SET_DOCKING_AXIS_MODE(self, gcmd):
+        mode = gcmd.get('MODE', None).lower()
+        if mode is None:
+            raise gcmd.error("MODE parameter is required")
+        if self.docking_axis is None:
+            raise gcmd.error("No docking_axis object found")
+        if mode not in ['static', 'balanced', 'minimize_z']:
+            raise gcmd.error("Invalid MODE parameter, must be one of: static, balanced, minimize_z")
+        
+        for _, dock_unit in self.dock_units.items():
+            dock_unit.axis_mode = mode
+            gcmd.respond_info(f"Set docking axis mode for dock unit {dock_unit.name} to {mode}")
+
     def get_tool_name(self, tool_number):
         for tool, tool_contents in self.tools.items():
             if tool_contents['tool_number'] == tool_number:
@@ -160,11 +177,13 @@ class ToolchangerHelper:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
             active_dock = self.get_active_dock()
             if active_dock is not None:
+                active_dock.retract_filament()
                 if active_dock.filament_cutter:
                     if active_dock.filament_sensor.runout_helper.filament_present:
                         active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
-            tool['dock_unit'].undock_toolhead(restore_pos=True)
+            tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            tool['dock_unit'].unretract_filament()
             if self.post_undock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.post_undock_gcode.render() + "\nM400")
@@ -175,10 +194,12 @@ class ToolchangerHelper:
             logging.info(f"Changing filament to tool {tool_name}")
             active_dock = self.get_active_dock()
             if active_dock.filament_cutter:
+                active_dock.retract_filament()
                 if active_dock.filament_sensor.runout_helper.filament_present:
                     tool['dock_unit'].save_init_pos()
-                    active_dock.cut_filament(restore_pos=True)
+                    active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
+            tool['dock_unit'].unretract_filament()
             if self.post_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.post_change_gcode.render() + "\nM400")
@@ -196,17 +217,18 @@ class ToolchangerHelper:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
             active_dock = self.get_active_dock()
             if active_dock is not None:
+                active_dock.retract_filament()
                 if active_dock.filament_cutter:
                     if active_dock.filament_sensor.runout_helper.filament_present:
                         active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
-            tool['dock_unit'].undock_toolhead(restore_pos=True)
+            tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            tool['dock_unit'].unretract_filament()
             if self.post_replace_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.post_replace_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-replace gcode failed: {str(e)}")
-        
 
     def cmd_INIT_DOCKS(self, gcmd):
         for _, dock_unit in self.dock_units.items():

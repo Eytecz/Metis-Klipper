@@ -218,6 +218,11 @@ class DockUnit:
         self.filament_sensor = config.get('filament_sensor', None)
         self.toolhead_detect_shuttle = config.get('toolhead_detect_shuttle', None)
         self.toolhead_detect_dock = config.get('toolhead_detect_dock', None)
+
+        self.retract_length = config.getfloat('retract_length', 40., minval=0.)
+        self.unretract_length = config.getfloat('unretract_length', 40., minval=0.)
+        self.retract_speed = config.getfloat('retract_speed', 20., above=0.)
+        self.unretract_speed = config.getfloat('unretract_speed', 20., above=0.)
         
         status_leds = config.get('status_leds', None)
         self.led_helper = None
@@ -300,7 +305,8 @@ class DockUnit:
         self.status = STATUS_UNINITIALIZED
         self.prev_currents = None
         self.led_ready = False
-        
+        self.previous_extruder = None
+        self.enable_filament_cutter = True
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -329,6 +335,9 @@ class DockUnit:
         self.gcode.register_mux_command('SET_AXIS_MODE', 'DOCK', self.name, 
                                         self.cmd_SET_AXIS_MODE,
                                         desc="Set docking axis mode")
+        self.gcode.register_mux_command('SET_CUTTER', 'DOCK', self.name,
+                                        self.cmd_SET_CUTTER,
+                                        desc="Enable/disable the filament cutter")
     
     def handle_connect(self):
         self.extruder = self.printer.lookup_object(self.extruder_name)
@@ -508,7 +517,13 @@ class DockUnit:
             raise gcmd.error(
                 f"Invalid dock status '{status}', valid statuses are: {', '.join(valid_statuses)}")
         self.set_status(status)
-        gcmd.respond_info(f"Dock {self.name} status set to {self.status}")   
+        gcmd.respond_info(f"Dock {self.name} status set to {self.status}")
+
+    def cmd_SET_CUTTER(self, gcmd):
+        enable = gcmd.get_int('ENABLE', 1)
+        self.enable_filament_cutter = bool(enable)
+        status = "enabled" if self.enable_filament_cutter else "disabled"
+        gcmd.respond_info(f"Dock {self.name} filament cutter {status}")   
 
     def cmd_CUT_FILAMENT(self, gcmd):
         restore_pos = gcmd.get_int('RESTORE_POS', 1)
@@ -522,6 +537,7 @@ class DockUnit:
         try:
             self.save_init_pos()
             cut_filament = gcmd.get_int('CUT_FILAMENT', 1)
+            self.retract_filament()
             if cut_filament:
                 self.cut_filament(restore_pos=False)
             self.dock_toolhead(restore_pos=False)
@@ -533,6 +549,7 @@ class DockUnit:
             self.undock_toolhead(restore_pos=False)
             if self.last_toolhead_pos is not None:
                 self.restore_last_pos(restore_axes=True)
+            self.unretract_filament()
         except Exception as e:
             raise gcmd.error(f"Error picking up extruder: {e}")
 
@@ -543,8 +560,55 @@ class DockUnit:
                 f"Invalid axis mode '{mode}', valid modes are: {', '.join(axis_modes.keys())}.")
         self.axis_mode = mode
         gcmd.respond_info(f"Dock {self.name} axis mode set to {self.axis_mode}.")
+
+    def check_set_extruder_temp(self, wait=False):
+        logging.info(f"Checking extruder temperature for dock {self.name} before cutting filament.")
+        pheaters = self.printer.lookup_object('heaters')
+        min_temp = self.extruder.heater.min_extrude_temp
+        target_temp = self.extruder.heater.target_temp
         
-    def cut_filament(self, restore_pos=True):
+        if not self.extruder.heater.can_extrude:
+            logging.info(f"Extruder heater cannot extrude")
+            # Extruder is too cold, heat it up
+            if target_temp < min_temp:
+                logging.info(f"Extruder target temp {target_temp}C is below min extrude temp {min_temp}C, setting to {min_temp + 10.}C")
+                # No valid target set, use min_extrude_temp + margin
+                pheaters.set_temperature(self.extruder.get_heater(), min_temp + 10., wait)
+            else:
+                logging.info(f"Extruder target temp {target_temp}C is above min extrude temp {min_temp}C")
+                # Target already set appropriately, wait if requested
+                if wait:
+                    logging.info(f"Waiting for extruder to reach target temp {target_temp}C")
+                    pheaters.set_temperature(self.extruder.get_heater(), target_temp, wait)
+        else:
+            logging.info(f"Extruder heater can extrude")
+            # Extruder is hot enough now, but check if target would cool it below threshold
+            if target_temp < min_temp:
+                logging.info(f"Extruder target temp {target_temp}C is below min extrude temp {min_temp}C,")
+                # Target is too low, would cool down - prevent this
+                pheaters.set_temperature(self.extruder.get_heater(), min_temp + 10., wait=False)
+
+    def activate_extruder(self):
+        if self.toolhead.get_extruder() == self.extruder:
+            return
+        self.previous_extruder = self.toolhead.get_extruder()
+        self.toolhead.flush_step_generation()
+        self.toolhead.set_extruder(self.extruder, self.extruder.last_position)
+        self.printer.send_event("extruder:activate_extruder")
+        self.toolhead.wait_moves()
+
+    def restore_extruder(self):
+        if self.previous_extruder is None or self.previous_extruder == self.extruder:
+            return
+        self.toolhead.flush_step_generation()
+        self.toolhead.set_extruder(self.previous_extruder, self.previous_extruder.last_position)
+        self.printer.send_event("extruder:activate_extruder")
+        self.toolhead.wait_moves()
+
+    def cut_filament(self, restore_pos=True, restore_axes=None):
+        if not self.enable_filament_cutter:
+            logging.info(f"Filament cutter disabled for dock {self.name}, skipping cut.")
+            return
         try:
             # Check dock status and set to cutting state
             if self.status not in STATUS_ENGAGED:
@@ -572,6 +636,8 @@ class DockUnit:
                     raise Exception(
                         f"No filament detected, cannot cut filament on dock {self.name}.")
             
+            self.check_set_extruder_temp(wait=False)
+
             # Check if custom cut g-code is defined else perform standard cut sequence
             if self.cut_gcode is not None:
                 try:
@@ -640,22 +706,32 @@ class DockUnit:
                 pos[1] = self.cutter_position_y + self.cutter_retract_y
                 self.toolhead.move(pos, self.travel_speed)
 
+                # Ensure extruder is still heated for retraction
+                self.check_set_extruder_temp(wait=True)
+
                 # Release tension on blade so it can retract (temporarily bypass extrude check)
-                extruder = self.printer.lookup_object(self.extruder_name)
-                can_extrude_original = extruder.heater.can_extrude  # Save current value
+                #extruder = self.printer.lookup_object(self.extruder_name)
+                #can_extrude_original = extruder.heater.can_extrude  # Save current value
                 try:
-                    extruder.heater.can_extrude = True  # Override to allow movement
+                    self.activate_extruder()
+                    #extruder.heater.can_extrude = True  # Override to allow movement
                     pos = self.toolhead.get_position()
                     pos[3] -= 2.0
                     self.toolhead.move(pos, 10.0)
                     pos[3] += 2.0
                     self.toolhead.move(pos, 10.0)
-                finally:
-                    extruder.heater.can_extrude = can_extrude_original  # Always restore
+                    self.toolhead.wait_moves()
+                    self.restore_extruder()
+                # finally:
+                #     extruder.heater.can_extrude = can_extrude_original  # Always restore
+                except Exception as e:
+                    raise Exception(f"Error retracting filament after cutting: {e}")
 
             # Restore previous positions
             if restore_pos:
-                self.restore_last_pos(restore_axes=True)
+                if restore_axes is None:
+                    restore_axes = self.restore_axes
+                self.restore_last_pos(restore_axes=restore_axes)
             else:
                 # Cleanup current position from toolhead
                 self.toolhead.wait_moves()
@@ -671,7 +747,7 @@ class DockUnit:
         except Exception as e:
             self.handle_exception(e, "cutting", pause_on_error=self.exception_pause)
 
-    def dock_toolhead(self, restore_pos=True):
+    def dock_toolhead(self, restore_pos=True, restore_axes=None):
         try:
             # Check dock status and set to docking state
             if self.status not in STATUS_ENGAGED:
@@ -694,6 +770,12 @@ class DockUnit:
                 except Exception as e:
                     raise Exception(f"Error executing docking gcode: {e}")
             else:
+                if self.last_toolhead_pos is not None:
+                    # Move 5mm above last toolhead position to ensure safe docking
+                    pos = self.last_toolhead_pos.copy()
+                    pos[2] += 5.0
+                    self.toolhead.move(pos, self.travel_speed)
+                    self.toolhead.wait_moves()
                 # Determine z-axis and docking axis positions for docking
                 if self.axis_mode == 'static' and self.docking_axis is False:
                     target_z_offset = self.docked_position_z + self.safe_offset_z
@@ -766,7 +848,9 @@ class DockUnit:
             if restore_pos:
                 pos[2] = self.safe_position_y
                 self.toolhead.move(pos, self.travel_speed)
-                self.restore_last_pos(restore_axes=True)
+                if restore_axes is None:
+                    restore_axes = self.restore_axes
+                self.restore_last_pos(restore_axes=restore_axes)
             else:
                 # Cleanup current position from toolhead
                 self.toolhead.wait_moves()
@@ -775,7 +859,7 @@ class DockUnit:
         except Exception as e:
             self.handle_exception(e, "docking", pause_on_error=self.exception_pause)
     
-    def undock_toolhead(self, restore_pos=True):
+    def undock_toolhead(self, restore_pos=True, restore_axes=None):
         try:
             # Check dock status and set to undocking state
             if self.status not in STATUS_DOCKED:
@@ -863,7 +947,9 @@ class DockUnit:
 
             # Restore previous positions
             if restore_pos:
-                self.restore_last_pos(restore_axes=True)
+                if restore_axes is None:
+                    restore_axes = self.restore_axes
+                self.restore_last_pos(restore_axes=restore_axes)
             else:
                 # Cleanup current position from toolhead
                 self.toolhead.wait_moves()
@@ -871,6 +957,30 @@ class DockUnit:
             self.set_status(STATUS_ENGAGED)
         except Exception as e:
             self.handle_exception(e, "undocking", pause_on_error=self.exception_pause)
+
+    def retract_filament(self):
+        try:
+            self.check_set_extruder_temp(wait=True)
+            self.activate_extruder()
+            pos = self.toolhead.get_position()
+            pos[3] -= self.retract_length
+            self.toolhead.move(pos, self.retract_speed)
+            self.toolhead.wait_moves()
+            self.restore_extruder()
+        except Exception as e:
+            self.handle_exception(e, "retracting filament", pause_on_error=self.exception_pause)
+
+    def unretract_filament(self):
+        try:
+            self.check_set_extruder_temp(wait=True)
+            self.activate_extruder()
+            pos = self.toolhead.get_position()
+            pos[3] += self.unretract_length
+            self.toolhead.move(pos, self.unretract_speed)
+            self.toolhead.wait_moves()
+            self.restore_extruder()
+        except Exception as e:
+            self.handle_exception(e, "unretracting filament", pause_on_error=self.exception_pause)
 
     def save_init_pos(self):
         # Save current toolhead and docking_axis positions for restore after operation
@@ -889,6 +999,9 @@ class DockUnit:
                 return
             elif restore_axes is True:
                 restore_axes = self.restore_axes
+            else:
+                restore_axes = restore_axes
+            
             
             if self.last_toolhead_pos is None:
                     raise self.printer.command_error(
