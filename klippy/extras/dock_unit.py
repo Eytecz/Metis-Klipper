@@ -635,7 +635,7 @@ class DockUnit:
                 raise Exception("Cutter position calibration requires an active spool unit loaded on the dock's extruder")
             
             # Update spool unit state
-            spool_unit.set_state('calibrating')
+            spool_unit.set_status('calibrating')
 
             # Ensure axes are homed
             self.enabled_check()
@@ -676,7 +676,7 @@ class DockUnit:
             spool_unit.restore_extruder()
 
             # Restore spool unit state
-            spool_unit.set_state('loaded')
+            spool_unit.set_status('loaded')
 
             # Save config values
             configfile = self.printer.lookup_object('configfile')
