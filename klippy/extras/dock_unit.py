@@ -568,6 +568,7 @@ class DockUnit:
     
     def cmd_CALIBRATE_CUTTER_POSITION(self, gcmd):
         try:
+            self.save_init_pos()
             self.calibrate_cutter_position()
         except Exception as e:
             raise gcmd.error(f"Error calibrating cutter position: {e}")
@@ -626,10 +627,10 @@ class DockUnit:
 
             # Check if this dock/toolhead has a loaded spool unit
             spool_unit = None
-            for spool_unit in self.printer.lookup_objects('spool_unit'):
-                if spool_unit[1].get_extruder_name == self.extruder_name:
-                    if spool_unit[1].get_status(self.reactor.monotonic())['status'] == 'loaded':
-                        spool_unit = spool_unit[1]
+            for _, unit in self.printer.lookup_objects('spool_unit'):
+                if unit.get_extruder_name() == self.extruder_name:  # Also add () - it's a method
+                    if unit.get_status(self.reactor.monotonic())['status'] == 'loaded':
+                        spool_unit = unit
                         break
             if spool_unit is None:
                 raise Exception("Cutter position calibration requires an active spool unit loaded on the dock's extruder")
@@ -670,7 +671,7 @@ class DockUnit:
                 pos[3] -= step_size
             self.toolhead_sensor_cutter_distance = dist
             pos[3] += self.toolhead_sensor_cutter_distance # Move back to starting position
-            self.toolhead.move()
+            self.toolhead.move(pos, speed)
 
             # Restore extruder state
             spool_unit.restore_extruder()
@@ -1042,6 +1043,7 @@ class DockUnit:
 
     def retract_filament(self):
         try:
+            logging.info(f"Retracting filament on dock {self.name}")
             self.activate_extruder()
             self.check_set_extruder_temp(wait=True)
             pos = self.toolhead.get_position()
@@ -1054,6 +1056,7 @@ class DockUnit:
 
     def unretract_filament(self):
         try:
+            logging.info(f"Unretracting filament on dock {self.name}")
             self.activate_extruder()
             self.check_set_extruder_temp(wait=True)
             pos = self.toolhead.get_position()
@@ -1069,6 +1072,7 @@ class DockUnit:
             logging.info(f"No toolhead sensor to cutter distance calibrated for dock {self.name}, skipping finalize load to cutter")
             return
         try:
+            logging.info(f"Finalizing load to cutter on dock {self.name}")
             pos = self.toolhead.get_position()
             pos[3] += self.toolhead_sensor_cutter_distance
             speed = 5.
