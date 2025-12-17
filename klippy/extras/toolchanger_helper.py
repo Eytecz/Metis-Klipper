@@ -36,6 +36,9 @@ class ToolchangerHelper:
         self.pre_dock_gcode = None
         if config.get('pre_dock_gcode', None) is not None:
             self.pre_dock_gcode = gcode_macro.load_template(config, 'pre_dock_gcode', '')
+        self.pre_change_gcode = None
+        if config.get('pre_change_gcode', None) is not None:
+            self.pre_change_gcode = gcode_macro.load_template(config, 'pre_change_gcode', '')
         self.post_undock_gcode = None
         if config.get('post_undock_gcode', None) is not None:
             self.post_undock_gcode = gcode_macro.load_template(config, 'post_undock_gcode', '')
@@ -106,12 +109,15 @@ class ToolchangerHelper:
         try:      
             self.handle_tool_request(tool_number)
         except Exception as e:
-            self.restore_toolchanger()
-            try:
-                self.gcode.run_script_from_command("UNSELECT_TOOL")
-            except Exception as unselect_error:
-                logging.error(f"Failed to run UNSELECT_TOOL script: {str(unselect_error)}")
-            raise gcmd.error("Tool request failed: %s" % str(e))
+            error_msg = f"Tool request failed: {str(e)}"
+            logging.error(error_msg)
+            
+            # Set toolchanger to ERROR status so it won't cancel the print
+            self.toolchanger.status = 'error'
+            self.toolchanger.error_message = error_msg
+            
+            self.gcode.run_script_from_command("PAUSE")
+            gcmd.respond_info(error_msg)
 
     def cmd_SET_DOCKING_AXIS_MODE(self, gcmd):
         mode = gcmd.get('MODE', None).lower()
@@ -169,20 +175,22 @@ class ToolchangerHelper:
         
         elif tool_state == 'loaded' and dock_state == 'docked': # Change toolhead
             logging.info(f"Changing to tool {tool_name}")
-            tool['dock_unit'].save_init_pos()
+            active_dock = self.get_active_dock()
+            if active_dock is not None:
+                active_dock.retract_filament()
             if self.pre_dock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
-            active_dock = self.get_active_dock()
+            tool['dock_unit'].save_init_pos()
             if active_dock is not None:
-                active_dock.retract_filament()
-                if active_dock.filament_cutter:
-                    if active_dock.filament_sensor.runout_helper.filament_present:
-                        active_dock.cut_filament(restore_pos=False)
+                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
+                    active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
             tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            if tool['dock_unit'].filament_cutter:
+                tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
             if self.post_undock_gcode is not None:
                 try:
@@ -193,13 +201,20 @@ class ToolchangerHelper:
         elif tool_state == 'idle' and dock_state == 'engaged': # Change filament
             logging.info(f"Changing filament to tool {tool_name}")
             active_dock = self.get_active_dock()
-            if active_dock.filament_cutter:
+            if active_dock is not None:
                 active_dock.retract_filament()
-                if active_dock.filament_sensor.runout_helper.filament_present:
+            if self.pre_change_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Pre-change gcode failed: {str(e)}")
+            if active_dock is not None:
+                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
                     tool['dock_unit'].save_init_pos()
                     active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
-            tool['dock_unit'].finalize_load_to_cutter()
+            if tool['dock_unit'].filament_cutter:
+                tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
             if self.post_change_gcode is not None:
                 try:
@@ -209,22 +224,30 @@ class ToolchangerHelper:
                 
         elif tool_state == 'idle' and dock_state == 'docked': # Replace toolhead and filament
             logging.info(f"Replacing toolhead and filament to tool {tool_name}")
+            active_dock = self.get_active_dock()
+            if active_dock is not None:
+                active_dock.retract_filament()
+            if self.pre_change_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Pre-change gcode failed: {str(e)}")
             tool['spool_unit'].spool_load()
-            tool['dock_unit'].finalize_load_to_cutter()
-            tool['dock_unit'].save_init_pos()
             if self.pre_dock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
-            active_dock = self.get_active_dock()
+            if tool['dock_unit'].filament_cutter:
+                tool['dock_unit'].finalize_load_to_cutter()
+            tool['dock_unit'].save_init_pos()
             if active_dock is not None:
-                active_dock.retract_filament()
-                if active_dock.filament_cutter:
-                    if active_dock.filament_sensor.runout_helper.filament_present:
-                        active_dock.cut_filament(restore_pos=False)
+                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
+                    active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
             tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            if tool['dock_unit'].filament_cutter:
+                tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
             if self.post_replace_gcode is not None:
                 try:

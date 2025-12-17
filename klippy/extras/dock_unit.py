@@ -219,8 +219,8 @@ class DockUnit:
         self.toolhead_detect_shuttle = config.get('toolhead_detect_shuttle', None)
         self.toolhead_detect_dock = config.get('toolhead_detect_dock', None)
 
-        self.retract_length = config.getfloat('retract_length', 40., minval=0.)
-        self.unretract_length = config.getfloat('unretract_length', 40., minval=0.)
+        self.retract_length = config.getfloat('retract_length', 30., minval=0.)
+        self.unretract_length = config.getfloat('unretract_length', 30., minval=0.)
         self.retract_speed = config.getfloat('retract_speed', 20., above=0.)
         self.unretract_speed = config.getfloat('unretract_speed', 20., above=0.)
         
@@ -343,7 +343,13 @@ class DockUnit:
         self.gcode.register_mux_command('CALIBRATE_CUTTER_POSITION', 'DOCK', self.name,
                                         self.cmd_CALIBRATE_CUTTER_POSITION,
                                         desc="Calibrate the cutter position based on toolhead sensor")
-    
+        self.gcode.register_mux_command('SET_RETRACT_LENGTH', 'DOCK', self.name,
+                                        self.cmd_SET_RETRACT_LENGTH,
+                                        desc="Set the filament retract and unretract lengths")
+        self.gcode.register_mux_command('SET_UNRETRACT_LENGTH', 'DOCK', self.name,
+                                        self.cmd_SET_UNRETRACT_LENGTH,
+                                        desc="Set the filament unretract length")
+            
     def handle_connect(self):
         self.extruder = self.printer.lookup_object(self.extruder_name)
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -572,6 +578,42 @@ class DockUnit:
             self.calibrate_cutter_position()
         except Exception as e:
             raise gcmd.error(f"Error calibrating cutter position: {e}")
+    
+    def cmd_SET_RETRACT_LENGTH(self, gcmd):
+        length = gcmd.get_float('LENGTH', 0.)
+        if length < 0.:
+            raise gcmd.error("Retract length must be non-negative")
+        self.retract_length = length
+
+        # Save config values
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(f'dock_unit {self.name}', 'retract_length', f'{self.retract_length:.3f}')
+
+        def format_macro(macro: str) -> str:
+                return f'<a class="command">{macro}</a>'
+        
+        self.gcode.respond_info(
+            f"Retract length updated for extruder {self.extruder_name} successfully to {self.retract_length} mm.\n"
+            f"Please use {format_macro(f'SAVE_CONFIG')} to save the calibration values."
+            )
+    
+    def cmd_SET_UNRETRACT_LENGTH(self, gcmd):
+        length = gcmd.get_float('LENGTH', 0.)
+        if length < 0.:
+            raise gcmd.error("Unretract length must be non-negative")
+        self.unretract_length = length
+
+        # Save config values
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(f'dock_unit {self.name}', 'unretract_length', f'{self.unretract_length:.3f}')
+
+        def format_macro(macro: str) -> str:
+                return f'<a class="command">{macro}</a>'
+        
+        self.gcode.respond_info(
+            f"Unretract length updated for extruder {self.extruder_name} successfully to {self.unretract_length} mm.\n"
+            f"Please use {format_macro(f'SAVE_CONFIG')} to save the calibration values."
+            )
 
     def check_set_extruder_temp(self, wait=False):
         logging.info(f"Checking extruder temperature for dock {self.name} before cutting filament.")
@@ -1050,6 +1092,7 @@ class DockUnit:
             pos[3] -= self.retract_length
             self.toolhead.move(pos, self.retract_speed)
             self.toolhead.wait_moves()
+            self.toolhead.set_position(self.toolhead.get_position())
             self.restore_extruder()
         except Exception as e:
             self.handle_exception(e, "retracting filament", pause_on_error=self.exception_pause)
@@ -1057,13 +1100,14 @@ class DockUnit:
     def unretract_filament(self):
         try:
             logging.info(f"Unretracting filament on dock {self.name}")
-            self.activate_extruder()
+            #self.activate_extruder()
             self.check_set_extruder_temp(wait=True)
             pos = self.toolhead.get_position()
             pos[3] += self.unretract_length
             self.toolhead.move(pos, self.unretract_speed)
             self.toolhead.wait_moves()
-            self.restore_extruder()
+            self.toolhead.set_position(self.toolhead.get_position())
+            #self.restore_extruder()
         except Exception as e:
             self.handle_exception(e, "unretracting filament", pause_on_error=self.exception_pause)
     
@@ -1084,6 +1128,7 @@ class DockUnit:
 
     def save_init_pos(self):
         # Save current toolhead and docking_axis positions for restore after operation
+        self.toolhead.set_position(self.toolhead.get_position())
         self.last_toolhead_pos = self.toolhead.get_position()
         if self.docking_axis:
             self.last_docking_axis_pos = self.docking_axis.get_position()
