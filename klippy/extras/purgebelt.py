@@ -157,11 +157,11 @@ class PurgeBelt:
         new_pos[2] = self.park_pos_z
         # Keep current extruder position
         self.toolhead.move(new_pos, self.travel_speed)
-        self.toolhead.wait_moves()
+        #self.toolhead.wait_moves()
     
     def restore_pos(self):
         # Ensure all moves are done before restoring position
-        self.toolhead.wait_moves()
+        #self.toolhead.wait_moves()
         self.toolhead.set_position(self.toolhead.get_position())
 
         # Return to initial position
@@ -171,7 +171,7 @@ class PurgeBelt:
             restore_pos = list(self.init_pos)
             restore_pos[3] = current_pos[3]  # Keep current E position
             self.toolhead.move(restore_pos, self.travel_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
     
     def purge_cycle(self, purge_length, layer_height, extrusion_width, extrusion_speed, pause_qty, pause_time):
         # Travel to park position
@@ -187,7 +187,7 @@ class PurgeBelt:
             purge_pos = list(current_pos)
             purge_pos[2] = purge_height
             self.toolhead.move(purge_pos, self.approach_speed) 
-            self.toolhead.wait_moves()      
+            #self.toolhead.wait_moves()      
 
             # Do the actual purging
             self.sync_purge_belt(layer_height, extrusion_width)
@@ -195,7 +195,7 @@ class PurgeBelt:
             extrude_pos = list(current_pos)
             extrude_pos[3] += purge_length
             self.toolhead.move(extrude_pos, extrusion_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.unsync_purge_belt()
 
             # Retract filament and keep belt running for an additional distance
@@ -205,14 +205,14 @@ class PurgeBelt:
             movepos = self.purge_belt_stepper.get_position()[0] + self.purge_belt_retract_travel_dist
             self.purge_belt_stepper.do_move(movepos, self.purge_belt_stepper.velocity, self.purge_belt_stepper.accel, sync=True)
             self.toolhead.move(retract_pos, self.retract_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             
             # Return to parking position
             current_pos = self.toolhead.get_position()
             park_pos = list(current_pos)
             park_pos[2] = self.park_pos_z
             self.toolhead.move(park_pos, self.travel_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
         else:
             purge_length_per_section = purge_length / (pause_qty + 1)
             for i in range(pause_qty + 1):
@@ -221,7 +221,7 @@ class PurgeBelt:
                 purge_pos = list(current_pos)
                 purge_pos[2] = purge_height
                 self.toolhead.move(purge_pos, self.approach_speed) 
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
 
                 # Do the actual purging
                 self.sync_purge_belt(layer_height, extrusion_width)
@@ -229,7 +229,7 @@ class PurgeBelt:
                 extrude_pos = list(current_pos)
                 extrude_pos[3] += purge_length_per_section
                 self.toolhead.move(extrude_pos, extrusion_speed)
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
                 self.unsync_purge_belt()
 
                 # Retract filament and keep belt running for an additional distance
@@ -239,14 +239,14 @@ class PurgeBelt:
                 movepos = self.purge_belt_stepper.get_position()[0] + self.purge_belt_retract_travel_dist
                 self.purge_belt_stepper.do_move(movepos, self.purge_belt_stepper.velocity, self.purge_belt_stepper.accel, sync=True)
                 self.toolhead.move(retract_pos, self.retract_speed)
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
 
                 # Return to parking position
                 current_pos = self.toolhead.get_position()
                 park_pos = list(current_pos)
                 park_pos[2] = self.park_pos_z
                 self.toolhead.move(park_pos, self.travel_speed)
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
 
                 # Dwell for the defined pause time if not last iteration
                 if i < pause_qty:
@@ -257,7 +257,7 @@ class PurgeBelt:
         pos_belt = self.purge_belt_stepper.get_position()[0]
         movepos = pos_belt + self.purge_belt_outfeed_length
         self.purge_belt_stepper.do_move(movepos, self.purge_belt_stepper.velocity, self.purge_belt_stepper.accel, sync=True)
-        self.toolhead.wait_moves()
+        #self.toolhead.wait_moves()
 
         # Return to start position
         self.restore_pos()

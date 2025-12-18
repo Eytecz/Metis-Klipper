@@ -221,7 +221,7 @@ class DockUnit:
 
         self.retract_length = config.getfloat('retract_length', 30., minval=0.)
         self.unretract_length = config.getfloat('unretract_length', 30., minval=0.)
-        self.retract_speed = config.getfloat('retract_speed', 20., above=0.)
+        self.retract_speed = config.getfloat('retract_speed', 100., above=0.)
         self.unretract_speed = config.getfloat('unretract_speed', 20., above=0.)
         
         status_leds = config.get('status_leds', None)
@@ -649,7 +649,7 @@ class DockUnit:
         self.toolhead.flush_step_generation()
         self.toolhead.set_extruder(self.extruder, self.extruder.last_position)
         self.printer.send_event("extruder:activate_extruder")
-        self.toolhead.wait_moves()
+        #self.toolhead.wait_moves()
 
     def restore_extruder(self):
         if self.previous_extruder is None or self.previous_extruder == self.extruder:
@@ -657,7 +657,7 @@ class DockUnit:
         self.toolhead.flush_step_generation()
         self.toolhead.set_extruder(self.previous_extruder, self.previous_extruder.last_position)
         self.printer.send_event("extruder:activate_extruder")
-        self.toolhead.wait_moves()
+        #self.toolhead.wait_moves()
 
     def calibrate_cutter_position(self):
         if self.status not in [STATUS_ENGAGED]:
@@ -693,7 +693,7 @@ class DockUnit:
             pos[3] += 50.
             extrude_speed = 5.0
             self.toolhead.move(pos, extrude_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             
             # Perform cut
             self.cut_filament(restore_pos=True)
@@ -706,7 +706,7 @@ class DockUnit:
             pos[3] -= step_size
             while bool(spool_unit.toolhead_sensor.runout_helper.filament_present):
                 self.toolhead.move(pos, speed)
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
                 dist += step_size
                 if dist >= dist_max:
                     raise Exception("Toolhead sensor not triggered within expected range during cutter position calibration.")
@@ -847,7 +847,7 @@ class DockUnit:
                     self.toolhead.move(pos, 10.0)
                     pos[3] += 2.0
                     self.toolhead.move(pos, 10.0)
-                    self.toolhead.wait_moves()
+                    #self.toolhead.wait_moves()
                     self.restore_extruder()
                 except Exception as e:
                     raise Exception(f"Error retracting filament after cutting: {e}")
@@ -859,7 +859,7 @@ class DockUnit:
                 self.restore_last_pos(restore_axes=restore_axes)
             else:
                 # Cleanup current position from toolhead
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
                 self.toolhead.set_position(self.toolhead.get_position())
             
             # Verify that toolhead is still engaged
@@ -900,7 +900,7 @@ class DockUnit:
                     pos = self.last_toolhead_pos.copy()
                     pos[2] += 5.0
                     self.toolhead.move(pos, self.travel_speed)
-                    self.toolhead.wait_moves()
+                    #self.toolhead.wait_moves()
                 # Determine z-axis and docking axis positions for docking
                 if self.axis_mode == 'static' and self.docking_axis is False:
                     target_z_offset = self.docked_position_z + self.safe_offset_z
@@ -931,7 +931,7 @@ class DockUnit:
                 if movepos_z[0] is not None:
                     pos[2] = movepos_z[0]
                     self.toolhead.move(pos, self.travel_speed)
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
 
                 # Move into dock position (before slide step)
                 pos = self.toolhead.get_position()
@@ -978,7 +978,7 @@ class DockUnit:
                 self.restore_last_pos(restore_axes=restore_axes)
             else:
                 # Cleanup current position from toolhead
-                self.toolhead.wait_moves()
+                #self.toolhead.wait_moves()
                 self.toolhead.set_position(self.toolhead.get_position())
             self.set_status(STATUS_DOCKED)
         except Exception as e:
@@ -1091,7 +1091,7 @@ class DockUnit:
             pos = self.toolhead.get_position()
             pos[3] -= self.retract_length
             self.toolhead.move(pos, self.retract_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position())
             self.restore_extruder()
         except Exception as e:
@@ -1105,7 +1105,7 @@ class DockUnit:
             pos = self.toolhead.get_position()
             pos[3] += self.unretract_length
             self.toolhead.move(pos, self.unretract_speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position())
             #self.restore_extruder()
         except Exception as e:
@@ -1121,7 +1121,7 @@ class DockUnit:
             pos[3] += self.toolhead_sensor_cutter_distance
             speed = 5.
             self.toolhead.move(pos, speed)
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position())
         except Exception as e:
             self.handle_exception(e, "finalizing load to cutter", pause_on_error=self.exception_pause)
@@ -1136,7 +1136,7 @@ class DockUnit:
     def restore_last_pos(self, restore_axes=False):
         try:
             # Ensure all moves are done before restoring and cleanup position from toolhead
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position())
 
             # Restore requested axes to last position
@@ -1176,7 +1176,7 @@ class DockUnit:
                     self.toolhead.wait_moves()
                     
             # Set init positions to None
-            self.toolhead.wait_moves()
+            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position()) # Cleanup
             self.last_toolhead_pos = None
             self.last_docking_axis_pos = None
