@@ -64,7 +64,7 @@ class InsertHelper:
                 self.spool_unit.stepper_helper.do_set_position(0.)
                 self.spool_unit.stepper_helper.do_homing_move(movepos=500.0, triggered=True)
                 self.spool_unit.stepper_helper.do_set_position(0.)
-                self.spool_unit.stepper_helper.do_move(movepos=-10.0)
+                self.spool_unit.stepper_helper.do_move(movepos=-3.0)
                 self.homing_state = False
                 self.spool_unit.set_status(STATUS_IDLE)
             except Exception as e:

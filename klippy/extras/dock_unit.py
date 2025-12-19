@@ -1126,12 +1126,34 @@ class DockUnit:
         except Exception as e:
             self.handle_exception(e, "finalizing load to cutter", pause_on_error=self.exception_pause)
 
-    def save_init_pos(self):
-        # Save current toolhead and docking_axis positions for restore after operation
+    def save_init_pos(self, save_axes=None):
         self.toolhead.set_position(self.toolhead.get_position())
-        self.last_toolhead_pos = self.toolhead.get_position()
-        if self.docking_axis:
-            self.last_docking_axis_pos = self.docking_axis.get_position()
+        # Verify if custom save axes provided
+        # axes is to be a string list of axes to save, e.g. ['x', 'y', 'z', 'docking_axis']
+        if save_axes is not None:
+            for axis in save_axes:
+                if axis not in ['x', 'y', 'z', 'e', 'docking_axis']:
+                    raise self.printer.command_error(
+                        f"Invalid axis '{axis}' for saving position, valid axes are: x, y, z, e, docking_axis.")
+                curpos = self.toolhead.get_position()
+                if self.last_toolhead_pos is None:
+                    self.last_toolhead_pos = curpos
+                elif axis == 'x':
+                    self.last_toolhead_pos[0] = curpos[0]
+                elif axis == 'y':
+                    self.last_toolhead_pos[1] = curpos[1]
+                elif axis == 'z':
+                    self.last_toolhead_pos[2] = curpos[2]
+                elif axis == 'e':
+                    self.last_toolhead_pos[3] = curpos[3]
+                if axis == 'docking_axis' and self.docking_axis:
+                    docking_axis_pos = self.docking_axis.get_position()
+                    self.last_docking_axis_pos = docking_axis_pos
+        else:
+            # Save current toolhead and docking_axis positions for restore after operation
+            self.last_toolhead_pos = self.toolhead.get_position()
+            if self.docking_axis:
+                self.last_docking_axis_pos = self.docking_axis.get_position()
     
     def restore_last_pos(self, restore_axes=False):
         try:

@@ -178,12 +178,13 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            tool['dock_unit'].save_init_pos()
             if self.pre_dock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
-            tool['dock_unit'].save_init_pos()
+            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
                     active_dock.cut_filament(restore_pos=False)
@@ -203,14 +204,15 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            tool['dock_unit'].save_init_pos()
             if self.pre_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-change gcode failed: {str(e)}")
+            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
-                    tool['dock_unit'].save_init_pos()
                     active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
             if tool['dock_unit'].filament_cutter:
@@ -227,6 +229,7 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            tool['dock_unit'].save_init_pos()
             if self.pre_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
@@ -240,7 +243,7 @@ class ToolchangerHelper:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
-            tool['dock_unit'].save_init_pos()
+            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
                     active_dock.cut_filament(restore_pos=False)
