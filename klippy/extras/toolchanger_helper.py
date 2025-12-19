@@ -186,7 +186,7 @@ class ToolchangerHelper:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
             tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
-                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
+                if active_dock.filament_cutter:
                     active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
             tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
@@ -212,7 +212,7 @@ class ToolchangerHelper:
                     raise Exception(f"Pre-change gcode failed: {str(e)}")
             tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
-                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
+                if active_dock.filament_cutter:
                     active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
             if tool['dock_unit'].filament_cutter:
@@ -245,7 +245,7 @@ class ToolchangerHelper:
                 tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
-                if active_dock.filament_cutter and active_dock.filament_sensor.runout_helper.filament_present:
+                if active_dock.filament_cutter:
                     active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
             tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
