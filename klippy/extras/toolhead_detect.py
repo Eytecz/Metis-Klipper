@@ -226,7 +226,7 @@ class ToolheadDetect:
     def get_extruder_name(self):
         return self.extruder_name
 
-    def get_status(self, eventtime):
+    def get_status(self, eventtime=None):
         return {
             'toolhead_engaged': bool(self.toolhead_present),
             'toolhead_pending_state': bool(self.pending_state is not None),

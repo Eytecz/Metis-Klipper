@@ -16,6 +16,7 @@ class ToolchangerHelper:
         self.docking_axis = config.getboolean('docking_axis', True)
         self.restore_axes = config.getlist(
             'restore_axes', ['y', 'x', 'z', 'docking_axis'])
+        self.homing_extruder = config.get('homing_extruder', 'extruder')
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -48,7 +49,11 @@ class ToolchangerHelper:
         self.post_replace_gcode = None
         if config.get('post_replace_gcode', None) is not None:
             self.post_replace_gcode = gcode_macro.load_template(config, 'post_replace_gcode', '')
-    
+
+        # Internal state
+        self.engaged_tool = None
+        self.can_home = False
+
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         self.toolchanger = self.printer.lookup_object('toolchanger')
@@ -70,12 +75,13 @@ class ToolchangerHelper:
         
         # Step 2: Match toolhead_detect by extruder_name
         for detect_name, toolhead_detect in self.printer.lookup_objects('toolhead_detect'):
+            toolhead_detect.register_callback(self._toolhead_detect_callback)
             extruder_name = toolhead_detect.get_extruder_name()
             for tool, tool_contents in self.tools.items():
                 if tool_contents['extruder_name'] == extruder_name:
                     tool_contents['toolhead_detect'] = toolhead_detect
                     logging.info(f"Matched {detect_name} to tool {tool}")
-        
+
         # Step 3: Match spool_unit by name
         for spool_name, spool_unit in self.printer.lookup_objects('spool_unit'):
             tool = spool_name.split()[1]
@@ -94,6 +100,25 @@ class ToolchangerHelper:
                     logging.info(f"Matched {dock_name} to tool {tool}")
                 self.dock_units[dock_name] = dock_unit
     
+    def _toolhead_detect_callback(self, state):
+        # Update engaged_tool based on toolhead_detect states
+        for tool, contents in self.tools.items():
+            toolhead_detect = contents['toolhead_detect']
+            if toolhead_detect is not None:
+                is_engaged = toolhead_detect.query_state()
+                contents['toolhead_engaged'] = is_engaged
+                if is_engaged:
+                    self.engaged_tool = tool
+        if not any(contents['toolhead_engaged'] for contents in self.tools.values()):
+            self.engaged_tool = None
+        # Check if no more than one tool is engaged
+        engaged_tools = [tool for tool, contents in self.tools.items() if contents['toolhead_engaged']]
+        if len(engaged_tools) > 1:
+            logging.warning("Multiple tools detected as engaged: %s", engaged_tools)
+        # Update can_home status only if one tool is engaged
+        if len(engaged_tools) == 1:
+            self.can_home = self.engaged_tool['extruder_name'] == self.homing_extruder
+
     def cmd_TOOL_REQUEST(self, gcmd):
         tool_param = gcmd.get('TOOL', None)
         if tool_param is None:
@@ -274,6 +299,12 @@ class ToolchangerHelper:
             self.toolchanger.status = 'ready'
         except Exception:
             raise
+    
+    def get_status(self, eventtime=None):
+        return {
+            'engaged_tool': self.engaged_tool,
+            'can_home': self.can_home,
+        }
 
 
 def load_config(config):
