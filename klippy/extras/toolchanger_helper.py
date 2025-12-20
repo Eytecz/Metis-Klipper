@@ -20,6 +20,7 @@ class ToolchangerHelper:
 
         # Register event handlers
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
         # Register g-code commands
         self.gcode = self.printer.lookup_object('gcode')
@@ -51,7 +52,7 @@ class ToolchangerHelper:
             self.post_replace_gcode = gcode_macro.load_template(config, 'post_replace_gcode', '')
 
         # Internal state
-        self.engaged_tool = None
+        self.engaged_extruder = None
         self.can_home = False
 
     def handle_connect(self):
@@ -100,24 +101,26 @@ class ToolchangerHelper:
                     logging.info(f"Matched {dock_name} to tool {tool}")
                 self.dock_units[dock_name] = dock_unit
     
-    def _toolhead_detect_callback(self, state):
-        # Update engaged_tool based on toolhead_detect states
-        for tool, contents in self.tools.items():
-            toolhead_detect = contents['toolhead_detect']
-            if toolhead_detect is not None:
-                is_engaged = toolhead_detect.query_state()
-                contents['toolhead_engaged'] = is_engaged
-                if is_engaged:
-                    self.engaged_tool = tool
-        if not any(contents['toolhead_engaged'] for contents in self.tools.values()):
+    def handle_ready(self):
+        self._toolhead_detect_callback()
+
+    def _toolhead_detect_callback(self, state=None):
+        engaged_toolheads = []
+        for name, object in self.printer.lookup_objects('toolhead_detect'):
+            if object.query_state():
+                engaged_toolheads.append(object)
+        if not engaged_toolheads:
             self.engaged_tool = None
-        # Check if no more than one tool is engaged
-        engaged_tools = [tool for tool, contents in self.tools.items() if contents['toolhead_engaged']]
-        if len(engaged_tools) > 1:
-            logging.warning("Multiple tools detected as engaged: %s", engaged_tools)
-        # Update can_home status only if one tool is engaged
-        if len(engaged_tools) == 1:
-            self.can_home = self.engaged_tool['extruder_name'] == self.homing_extruder
+        if len(engaged_toolheads) == 1:
+            engaged_tool_object = engaged_toolheads[0]
+            self.engaged_extruder = engaged_tool_object.get_extruder_name()
+            if self.engaged_extruder == self.homing_extruder:
+                self.can_home = True
+            else:
+                self.can_home = False
+        else:
+            self.engaged_extruder = None
+            self.can_home = False
 
     def cmd_TOOL_REQUEST(self, gcmd):
         tool_param = gcmd.get('TOOL', None)
@@ -140,7 +143,6 @@ class ToolchangerHelper:
             # Set toolchanger to ERROR status so it won't cancel the print
             self.toolchanger.status = 'error'
             self.toolchanger.error_message = error_msg
-            
             self.gcode.run_script_from_command("PAUSE")
             gcmd.respond_info(error_msg)
 
@@ -302,7 +304,7 @@ class ToolchangerHelper:
     
     def get_status(self, eventtime=None):
         return {
-            'engaged_tool': self.engaged_tool,
+            'engaged_extruder': self.engaged_extruder,
             'can_home': self.can_home,
         }
 
