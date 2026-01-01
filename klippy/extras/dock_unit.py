@@ -1240,7 +1240,7 @@ class DockUnit:
                 movepos = [toolhead_movepos_z, None]
                 return movepos
             else:
-                toolhead_pos_z = self.toolhead.get_position()[2]
+                toolhead_pos_z = self.toolhead.get_position()[2] if self.last_toolhead_pos is None else self.last_toolhead_pos[2]
                 docking_axis_pos_z = self.docking_axis.get_position()
                 if self.axis_mode == 'balanced':
                     # Split the difference equally
