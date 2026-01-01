@@ -232,7 +232,7 @@ class ToolchangerHelper:
             for axis_group in restore_axes:
                 axes = axis_group.split()
                 if 'docking_axis' in axes and self.docking_axis:
-                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    speed = min(self.toolhead.max_velocity, self.docking_axis.stepper.velocity)
                     self.docking_axis.stepper.do_move(
                         self.last_docking_axis_pos, speed, 
                         self.docking_axis.stepper.accel, sync=False
@@ -244,7 +244,7 @@ class ToolchangerHelper:
                     pos[1] = self.last_toolhead_pos[1]
                 if 'z' in axes:
                     pos[2] = self.last_toolhead_pos[2]
-                self.toolhead.move(pos, self.travel_speed)
+                self.toolhead.move(pos, self.toolhead.max_velocity)
                 if 'docking_axis' in axes and self.docking_axis:
                     self.toolhead.wait_moves()
                     
@@ -263,7 +263,7 @@ class ToolchangerHelper:
         curpos = self.toolhead.get_position()
         if curpos[2] < safe_z:
             curpos[2] = safe_z
-            self.toolhead.move(curpos, self.travel_speed)
+            self.toolhead.move(curpos, self.toolhead.max_velocity)
         
     def handle_tool_request(self, tool_number):
         # Get the tool name
