@@ -1218,8 +1218,8 @@ class DockUnit:
     
     def _determine_movepos_z(self, target_z_offset):
         try:
-            # Get current toolhead position
-            curpos = self.toolhead.get_position()
+            # Get current toolhead position or use last position
+            curpos = self.toolhead.get_position() if self.last_toolhead_pos is None else self.last_toolhead_pos
 
             # Check movepos z based on axis mode and target offset
             toolhead_max_z = self.toolhead.get_kinematics().axes_max[2]
@@ -1237,14 +1237,11 @@ class DockUnit:
                 if toolhead_movepos_z > toolhead_max_z or toolhead_movepos_z < toolhead_min_z:
                     raise Exception(
                         f"Required toolhead Z position {toolhead_movepos_z} out of bounds.")
-                logging.info(f"Determined cut movepos_z: {toolhead_movepos_z}")
                 movepos = [toolhead_movepos_z, None]
                 return movepos
             else:
                 toolhead_pos_z = self.toolhead.get_position()[2]
                 docking_axis_pos_z = self.docking_axis.get_position()
-                logging.info(f"Current positions: toolhead Z {toolhead_pos_z}, docking axis Z {docking_axis_pos_z}")
-                logging.info(f"Target offset z: {target_z_offset}")
                 if self.axis_mode == 'balanced':
                     # Split the difference equally
                     delta_z = (docking_axis_pos_z - toolhead_pos_z) + target_z_offset
@@ -1254,9 +1251,7 @@ class DockUnit:
                     # Minimize toolhead movement, docking axis does most of the work
                     docking_axis_movepos_z = toolhead_pos_z + target_z_offset
                     toolhead_movepos_z = toolhead_pos_z
-            
-            logging.info(f"Initial calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
-            
+
             # Correct for axes bounds if needed
             for _ in range(2):
                 # Check 1: Toolhead may never move below current position
@@ -1296,9 +1291,7 @@ class DockUnit:
                     f"docking axis would be {docking_axis_movepos_z:.2f}mm "
                     f"(limits: {docking_axis_min_z:.2f} to {docking_axis_max_z:.2f}mm)"
                 )
-            
-            logging.info(f"Final calculated movepos_z: toolhead {toolhead_movepos_z}, docking axis {docking_axis_movepos_z}")
-            
+                       
             movepos = [toolhead_movepos_z, docking_axis_movepos_z]
             return movepos
 
