@@ -353,6 +353,7 @@ class DockUnit:
     def handle_connect(self):
         self.extruder = self.printer.lookup_object(self.extruder_name)
         self.toolhead = self.printer.lookup_object('toolhead')
+        self.toolchanger_helper = self.printer.lookup_object('toolchanger_helper')
         if self.travel_speed is None:
             self.travel_speed = self.toolhead.get_max_velocity()[0]
 
@@ -1157,9 +1158,7 @@ class DockUnit:
     
     def restore_last_pos(self, restore_axes=False):
         try:
-            # Ensure all moves are done before restoring and cleanup position from toolhead
-            #self.toolhead.wait_moves()
-            self.toolhead.set_position(self.toolhead.get_position())
+            self.toolhead.set_position(self.toolhead.get_position()) # Cleanup
 
             # Restore requested axes to last position
             if restore_axes is False:
@@ -1198,10 +1197,10 @@ class DockUnit:
                     self.toolhead.wait_moves()
                     
             # Set init positions to None
-            #self.toolhead.wait_moves()
             self.toolhead.set_position(self.toolhead.get_position()) # Cleanup
             self.last_toolhead_pos = None
             self.last_docking_axis_pos = None
+
         except Exception as e:
             self.handle_exception(e, "restoring position", pause_on_error=self.exception_pause)
 
@@ -1219,8 +1218,8 @@ class DockUnit:
     def _determine_movepos_z(self, target_z_offset):
         try:
             # Get current toolhead position or use last position
-            curpos = self.toolhead.get_position() if self.last_toolhead_pos is None else self.last_toolhead_pos
-
+            curpos = self.toolhead.get_position()
+            
             # Check movepos z based on axis mode and target offset
             toolhead_max_z = self.toolhead.get_kinematics().axes_max[2]
             toolhead_min_z = self.toolhead.get_kinematics().axes_min[2]

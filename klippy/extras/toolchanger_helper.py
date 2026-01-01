@@ -54,6 +54,8 @@ class ToolchangerHelper:
         # Internal state
         self.engaged_extruder = None
         self.can_home = False
+        self.last_docking_axis_pos = None
+        self.last_toolhead_pos = None
 
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -178,6 +180,91 @@ class ToolchangerHelper:
         else:
             raise Exception("Multiple dock units are currently engaged, manual intervention required.")
 
+    def save_pos(self, save_axes=None):
+        self.toolhead.set_position(self.toolhead.get_position())
+        # Verify if custom save axes provided
+        # axes is to be a string list of axes to save, e.g. ['x', 'y', 'z', 'docking_axis']
+        if save_axes is not None:
+            for axis in save_axes:
+                if axis not in ['x', 'y', 'z', 'e', 'docking_axis']:
+                    raise self.printer.command_error(
+                        f"Invalid axis '{axis}' for saving position, valid axes are: x, y, z, e, docking_axis.")
+                curpos = self.toolhead.get_position()
+                if self.last_toolhead_pos is None:
+                    self.last_toolhead_pos = curpos
+                elif axis == 'x':
+                    self.last_toolhead_pos[0] = curpos[0]
+                elif axis == 'y':
+                    self.last_toolhead_pos[1] = curpos[1]
+                elif axis == 'z':
+                    self.last_toolhead_pos[2] = curpos[2]
+                elif axis == 'e':
+                    self.last_toolhead_pos[3] = curpos[3]
+                if axis == 'docking_axis' and self.docking_axis:
+                    docking_axis_pos = self.docking_axis.get_position()
+                    self.last_docking_axis_pos = docking_axis_pos
+        else:
+            # Save current toolhead and docking_axis positions for restore after operation
+            self.last_toolhead_pos = self.toolhead.get_position()
+            if self.docking_axis:
+                self.last_docking_axis_pos = self.docking_axis.get_position()
+    
+    def restore_pos(self, restore_axes=False):
+        try:
+            self.toolhead.set_position(self.toolhead.get_position())
+            # Restore requested axes to last position
+            if restore_axes is False:
+                return
+            elif restore_axes is True:
+                restore_axes = self.restore_axes
+            else:
+                restore_axes = restore_axes
+            
+            if self.last_toolhead_pos is None:
+                    raise self.printer.command_error(
+                        f"Cannot restore toolhead position, no saved position found")
+        
+            if self.docking_axis:
+                if self.last_docking_axis_pos is None:
+                    raise self.printer.command_error(
+                        f"Cannot restore docking axis position, no saved position found")
+
+            for axis_group in restore_axes:
+                axes = axis_group.split()
+                if 'docking_axis' in axes and self.docking_axis:
+                    speed = min(self.travel_speed, self.docking_axis.stepper.velocity)
+                    self.docking_axis.stepper.do_move(
+                        self.last_docking_axis_pos, speed, 
+                        self.docking_axis.stepper.accel, sync=False
+                    )
+                pos = self.toolhead.get_position()
+                if 'x' in axes:
+                    pos[0] = self.last_toolhead_pos[0]
+                if 'y' in axes:
+                    pos[1] = self.last_toolhead_pos[1]
+                if 'z' in axes:
+                    pos[2] = self.last_toolhead_pos[2]
+                self.toolhead.move(pos, self.travel_speed)
+                if 'docking_axis' in axes and self.docking_axis:
+                    self.toolhead.wait_moves()
+                    
+            # Set init positions to None
+            self.toolhead.set_position(self.toolhead.get_position())
+            self.last_toolhead_pos = None
+            self.last_docking_axis_pos = None
+
+        except Exception as e:
+            raise Exception(f"Restore position failed: {str(e)}")
+    
+    def move_to_safe_z(self, safe_offset=10.0):
+        if self.last_toolhead_pos is None:
+            return  # No saved position, cannot determine safe Z
+        safe_z = self.last_toolhead_pos[2] + safe_offset
+        curpos = self.toolhead.get_position()
+        if curpos[2] < safe_z:
+            curpos[2] = safe_z
+            self.toolhead.move(curpos, self.travel_speed)
+        
     def handle_tool_request(self, tool_number):
         # Get the tool name
         tool_name = self.get_tool_name(tool_number)
@@ -205,18 +292,20 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
-            tool['dock_unit'].save_init_pos()
+            self.save_pos()
             if self.pre_dock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
-            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
+            self.move_to_safe_z()
+            self.save_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter:
                     active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
-            tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            tool['dock_unit'].undock_toolhead(restore_pos=False)
+            self.restore_pos(restore_axes=self.restore_axes)
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
@@ -231,16 +320,18 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
-            tool['dock_unit'].save_init_pos()
+            self.save_pos()
             if self.pre_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-change gcode failed: {str(e)}")
-            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
+            self.move_to_safe_z()
+            self.save_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter:
-                    active_dock.cut_filament(restore_pos=True, restore_axes=self.restore_axes)
+                    active_dock.cut_filament(restore_pos=False)
+                    self.restore_pos(restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
@@ -256,7 +347,7 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
-            tool['dock_unit'].save_init_pos()
+            self.save_pos()
             if self.pre_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
@@ -268,14 +359,17 @@ class ToolchangerHelper:
                     self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-dock gcode failed: {str(e)}")
+            self.restore_pos(restore_axes=self.restore_axes)
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
-            tool['dock_unit'].save_init_pos(save_axes=['x', 'y', 'e'])
+            self.move_to_safe_z()
+            self.save_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter:
                     active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
-            tool['dock_unit'].undock_toolhead(restore_pos=True, restore_axes=self.restore_axes)
+            tool['dock_unit'].undock_toolhead(restore_pos=False)
+            self.restore_pos(restore_axes=self.restore_axes)
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
