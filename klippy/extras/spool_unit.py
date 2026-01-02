@@ -913,7 +913,7 @@ class SpoolUnit:
                     movepos = -2000.0
                 self.stepper_helper.do_set_position(0.)
                 self.stepper_helper.do_homing_move(movepos=movepos, triggered=False, homing_speed=self.stepper_helper.unload_speed)
-                movepos -= 10.0
+                movepos -= 3.0    # Back off a bit
                 self.stepper_helper.do_move(movepos)
                 self.hbridge_motor.scheduled_motion(pwm_value=-1.0, runtime=5.0) # Override interception
                 self.stepper_helper.do_set_position(0.)

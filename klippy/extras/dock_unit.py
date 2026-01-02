@@ -325,6 +325,9 @@ class DockUnit:
         self.gcode.register_mux_command('SET_DOCK_STATUS', 'DOCK', self.name,
                                         self.cmd_SET_DOCK_STATUS,
                                         desc="Set the dock unit status")
+        self.gcode.register_mux_command('QUERY_DOCK_STATUS', 'DOCK', self.name,
+                                        self.cmd_QUERY_DOCK_STATUS,
+                                        desc="Query the dock unit status")
         self.gcode.register_mux_command('CUT_FILAMENT', 'DOCK', self.name,
                                         self.cmd_CUT_FILAMENT,
                                         desc="Cut filament using dock cutter")
@@ -530,6 +533,9 @@ class DockUnit:
                 f"Invalid dock status '{status}', valid statuses are: {', '.join(valid_statuses)}")
         self.set_status(status)
         gcmd.respond_info(f"Dock {self.name} status set to {self.status}")
+    
+    def cmd_QUERY_DOCK_STATUS(self, gcmd):
+        gcmd.respond_info(f"Dock {self.name} status: {self.status}")
 
     def cmd_SET_CUTTER(self, gcmd):
         enable = gcmd.get_int('ENABLE', 1)
@@ -645,6 +651,8 @@ class DockUnit:
 
     def activate_extruder(self):
         if self.toolhead.get_extruder() == self.extruder:
+            # Already on correct extruder, clear previous to avoid stale restore
+            self.previous_extruder = None
             return
         self.previous_extruder = self.toolhead.get_extruder()
         self.toolhead.flush_step_generation()
@@ -653,11 +661,14 @@ class DockUnit:
         #self.toolhead.wait_moves()
 
     def restore_extruder(self):
+        logging.info(f"restore_extruder called: previous_extruder={self.previous_extruder.get_name() if self.previous_extruder else None}, self.extruder={self.extruder.get_name()}, current={self.toolhead.get_extruder().get_name()}")
         if self.previous_extruder is None or self.previous_extruder == self.extruder:
+            logging.info(f"restore_extruder: skipping restore (previous_extruder is None or same as self.extruder)")
             return
         self.toolhead.flush_step_generation()
         self.toolhead.set_extruder(self.previous_extruder, self.previous_extruder.last_position)
         self.printer.send_event("extruder:activate_extruder")
+        logging.info(f"restore_extruder: restored to {self.toolhead.get_extruder().get_name()}")
         #self.toolhead.wait_moves()
 
     def calibrate_cutter_position(self):
@@ -764,9 +775,11 @@ class DockUnit:
             # Check if toolhead has filament loaded
             if self.filament_sensor:
                 if not self.filament_sensor.runout_helper.filament_present:
-                    raise Exception(
+                    logging.info(
                         f"No filament detected, cannot cut filament on dock {self.name}.")
-            
+                    self.set_status(STATUS_ENGAGED)
+                    return
+                
             self.check_set_extruder_temp(wait=False)
 
             # Check if custom cut g-code is defined else perform standard cut sequence
@@ -848,7 +861,7 @@ class DockUnit:
                     self.toolhead.move(pos, 10.0)
                     pos[3] += 2.0
                     self.toolhead.move(pos, 10.0)
-                    #self.toolhead.wait_moves()
+                    self.toolhead.wait_moves()
                     self.restore_extruder()
                 except Exception as e:
                     raise Exception(f"Error retracting filament after cutting: {e}")

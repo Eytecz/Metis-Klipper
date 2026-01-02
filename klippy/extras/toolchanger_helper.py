@@ -32,6 +32,8 @@ class ToolchangerHelper:
                                     desc="Set docking axis mode")
         self.gcode.register_command('RESTORE_TOOLCHANGER', self.cmd_RESTORE_TOOLCHANGER,
                                     desc="Restore toolchanger to ready state after error")
+        self.gcode.register_command('EVALUATE_SLICER_USED_EXTRUDERS', self.cmd_EVALUATE_SLICER_USED_EXTRUDERS,
+                                    desc="Evaluate which extruders are used in the current print")
         
         # Optional gcodes
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
@@ -56,6 +58,7 @@ class ToolchangerHelper:
         self.can_home = False
         self.last_docking_axis_pos = None
         self.last_toolhead_pos = None
+        self.last_safe_z = None
 
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -169,7 +172,7 @@ class ToolchangerHelper:
 
     def get_active_dock(self):
         active_docks = []
-        for _, dock_unit in self.dock_units.items():
+        for dock_name, dock_unit in self.dock_units.items():
             status = dock_unit.get_status(self.reactor.monotonic())['status']
             if status == 'engaged':
                 active_docks.append(dock_unit)
@@ -255,15 +258,22 @@ class ToolchangerHelper:
 
         except Exception as e:
             raise Exception(f"Restore position failed: {str(e)}")
+            
+    def save_safe_z(self, safe_offset=10.0):
+        safe_z = self.toolhead.get_position()[2] + safe_offset
+        self.last_safe_z = safe_z
     
-    def move_to_safe_z(self, safe_offset=10.0):
-        if self.last_toolhead_pos is None:
-            return  # No saved position, cannot determine safe Z
-        safe_z = self.last_toolhead_pos[2] + safe_offset
-        curpos = self.toolhead.get_position()
-        if curpos[2] < safe_z:
-            curpos[2] = safe_z
-            self.toolhead.move(curpos, self.toolhead.max_velocity)
+    def clear_safe_z(self):
+        self.last_safe_z = None
+        
+    def move_to_safe_z(self):
+        if self.last_safe_z is None:
+            logging.info("No safe Z defined, skipping move to safe Z")
+            return # No safe z defined
+        pos = self.toolhead.get_position()
+        if pos[2] < self.last_safe_z:
+            pos[2] = self.last_safe_z
+            self.toolhead.move(pos, self.toolhead.max_velocity)
         
     def handle_tool_request(self, tool_number):
         # Get the tool name
@@ -292,6 +302,8 @@ class ToolchangerHelper:
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            self.save_safe_z()
+            self.move_to_safe_z()
             self.save_pos()
             if self.pre_dock_gcode is not None:
                 try:
@@ -301,25 +313,25 @@ class ToolchangerHelper:
             self.move_to_safe_z()
             self.save_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
-                if active_dock.filament_cutter:
-                    active_dock.cut_filament(restore_pos=False)
                 active_dock.dock_toolhead(restore_pos=False)
+            tool['dock_unit'].unretract_filament()
             tool['dock_unit'].undock_toolhead(restore_pos=False)
             self.restore_pos(restore_axes=self.restore_axes)
-            if tool['dock_unit'].filament_cutter:
-                tool['dock_unit'].finalize_load_to_cutter()
-            tool['dock_unit'].unretract_filament()
             if self.post_undock_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.post_undock_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-undock gcode failed: {str(e)}")
+            self.move_to_safe_z()
+            self.clear_safe_z()
                 
         elif tool_state == 'idle' and dock_state == 'engaged': # Change filament
             logging.info(f"Changing filament to tool {tool_name}")
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            self.save_safe_z()
+            self.move_to_safe_z()
             self.save_pos()
             if self.pre_change_gcode is not None:
                 try:
@@ -330,7 +342,8 @@ class ToolchangerHelper:
             self.save_pos(save_axes=['x', 'y', 'e'])
             if active_dock is not None:
                 if active_dock.filament_cutter:
-                    active_dock.cut_filament(restore_pos=False)
+                    active_dock.save_init_pos()
+                    active_dock.cut_filament(restore_pos=True)
                     self.restore_pos(restore_axes=self.restore_axes)
             tool['spool_unit'].spool_load()
             if tool['dock_unit'].filament_cutter:
@@ -341,35 +354,36 @@ class ToolchangerHelper:
                     self.gcode.run_script_from_command(self.post_change_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-change gcode failed: {str(e)}")
+            self.move_to_safe_z()
+            self.clear_safe_z()
                 
-        elif tool_state == 'idle' and dock_state == 'docked': # Replace toolhead and filament
+        elif tool_state == 'idle' and dock_state == 'docked': # Replace toolhead and filament (with cutter possibly)
             logging.info(f"Replacing toolhead and filament to tool {tool_name}")
             active_dock = self.get_active_dock()
             if active_dock is not None:
                 active_dock.retract_filament()
+            self.save_safe_z()
+            self.move_to_safe_z()
             self.save_pos()
+            if self.pre_dock_gcode is not None:
+                try:
+                    self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
+                except Exception as e:
+                    raise Exception(f"Pre-dock gcode failed: {str(e)}")
+            self.move_to_safe_z()
+            self.save_pos(save_axes=['x', 'y', 'e'])
+            if active_dock is not None:
+                active_dock.dock_toolhead(restore_pos=False)
+            tool['dock_unit'].undock_toolhead(restore_pos=False)
+            if tool['dock_unit'].filament_cutter:
+                tool['dock_unit'].cut_filament(restore_pos=False)
+            self.restore_pos(restore_axes=self.restore_axes)
             if self.pre_change_gcode is not None:
                 try:
                     self.gcode.run_script_from_command(self.pre_change_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Pre-change gcode failed: {str(e)}")
             tool['spool_unit'].spool_load()
-            if self.pre_dock_gcode is not None:
-                try:
-                    self.gcode.run_script_from_command(self.pre_dock_gcode.render() + "\nM400")
-                except Exception as e:
-                    raise Exception(f"Pre-dock gcode failed: {str(e)}")
-            self.restore_pos(restore_axes=self.restore_axes)
-            if tool['dock_unit'].filament_cutter:
-                tool['dock_unit'].finalize_load_to_cutter()
-            self.move_to_safe_z()
-            self.save_pos(save_axes=['x', 'y', 'e'])
-            if active_dock is not None:
-                if active_dock.filament_cutter:
-                    active_dock.cut_filament(restore_pos=False)
-                active_dock.dock_toolhead(restore_pos=False)
-            tool['dock_unit'].undock_toolhead(restore_pos=False)
-            self.restore_pos(restore_axes=self.restore_axes)
             if tool['dock_unit'].filament_cutter:
                 tool['dock_unit'].finalize_load_to_cutter()
             tool['dock_unit'].unretract_filament()
@@ -378,6 +392,55 @@ class ToolchangerHelper:
                     self.gcode.run_script_from_command(self.post_replace_gcode.render() + "\nM400")
                 except Exception as e:
                     raise Exception(f"Post-replace gcode failed: {str(e)}")
+            self.move_to_safe_z()
+            self.clear_safe_z()
+
+    def cmd_EVALUATE_SLICER_USED_EXTRUDERS(self, gcmd):
+        slicer_extruders_raw = gcmd.get('IS_EXTRUDER_USED', None)
+        logging.info(f"Evaluating slicer used extruders: {slicer_extruders_raw}")
+        if slicer_extruders_raw is None:
+            raise gcmd.error("IS_EXTRUDER_USED parameter is required")
+        # Convert comma-separated string to list of booleans
+        slicer_extruders = [s.strip().lower() in ['true', '1'] for s in slicer_extruders_raw.split(',')]
+
+        # used_extruders is a list of boolean values indicating if each extruder is used
+        extruders_used = []
+        for i, is_used in enumerate(slicer_extruders):
+            if is_used:
+                tool_name = self.get_tool_name(i)
+                if tool_name is not None:
+                    extruders_used.append(tool_name)
+                else:
+                    logging.info(f"Extruder {i} has no associated tool")
+
+        # Report tool status and content
+        tool_info = {}
+        for tool_name in extruders_used:
+            tool = self.tools[tool_name]
+            tool_state = tool['spool_unit'].get_status(self.reactor.monotonic())['status']
+            dock_state = tool['dock_unit'].get_status(self.reactor.monotonic())['status']
+            spool_diameter = tool['spool_unit'].estimate_spool_diameter()
+            tool_info[tool_name] = {
+                'tool_number': tool['tool_number'],
+                'spool_status': tool_state,
+                'dock_status': dock_state,
+                'estimated_spool_diameter': spool_diameter
+            }
+        
+        # Prepare a one-line report per tool
+        messages = []
+        for tool_name, info in tool_info.items():
+            msg = (f"Tool {tool_name} (number {info['tool_number']}): "
+                   f"Spool status: {info['spool_status']}, "
+                   f"Dock status: {info['dock_status']}, "
+                   f"Estimated spool diameter: {info['estimated_spool_diameter']:.2f} mm")
+            messages.append(msg)
+
+        # Append all messages to single gcode response
+        msg = "Tools used in print:\n" + "\n".join(messages)
+        gcmd.respond_info(msg)
+
+        
 
     def cmd_INIT_DOCKS(self, gcmd):
         for _, dock_unit in self.dock_units.items():
